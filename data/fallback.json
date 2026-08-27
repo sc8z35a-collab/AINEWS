@@ -1,0 +1,149 @@
+{
+  "generatedAt": "2026-08-27T13:08:00+09:00",
+  "articles": [
+    {
+      "id": "fb-nvidia-huggingface-0827",
+      "title": "Nvidia agrees to buy Hugging Face for $12.9 billion, report says",
+      "url": "https://www.reuters.com/technology/nvidia-talks-acquire-hugging-face-13-billion-deal-business-insider-reports-2026-08-27/",
+      "sourceUrl": "https://www.reuters.com/",
+      "source": "Reuters",
+      "publishedAt": "2026-08-27T04:00:00Z",
+      "summary": "Nvidia has reportedly reached an agreement to acquire Hugging Face, highlighting the strategic value of open-source AI ecosystems and developer platforms.",
+      "feedKeys": ["global", "infra"],
+      "feedLabels": ["AI総合", "AIインフラ"],
+      "locale": "en-US"
+    },
+    {
+      "id": "fb-zoph-google-0827",
+      "title": "Thinking Machines Lab co-founder Barret Zoph joins Google DeepMind",
+      "url": "https://www.reuters.com/business/thinking-machines-lab-co-founder-barret-zoph-joins-google-2026-08-27/",
+      "sourceUrl": "https://www.reuters.com/",
+      "source": "Reuters",
+      "publishedAt": "2026-08-27T03:00:00Z",
+      "summary": "Barret Zoph is joining Google DeepMind, another sign that competition for experienced frontier-AI researchers remains intense.",
+      "feedKeys": ["global", "google"],
+      "feedLabels": ["AI総合", "Google"],
+      "locale": "en-US"
+    },
+    {
+      "id": "fb-nvidia-q2-0826",
+      "title": "NVIDIA reports $96.2 billion quarterly revenue as data center demand surges",
+      "url": "https://nvidianews.nvidia.com/news/nvidia-announces-financial-results-for-second-quarter-fiscal-2027",
+      "sourceUrl": "https://nvidianews.nvidia.com/",
+      "source": "NVIDIA Newsroom",
+      "publishedAt": "2026-08-26T20:00:00Z",
+      "summary": "NVIDIA reported fiscal Q2 2027 revenue of $96.2B and data center revenue of $89.0B, underscoring continued demand for AI compute infrastructure.",
+      "feedKeys": ["global", "infra"],
+      "feedLabels": ["AI総合", "AIインフラ"],
+      "locale": "en-US"
+    },
+    {
+      "id": "fb-openai-hf-0826",
+      "title": "OpenAI publishes update on the Hugging Face incident and the road ahead",
+      "url": "https://openai.com/news/",
+      "sourceUrl": "https://openai.com/",
+      "source": "OpenAI",
+      "publishedAt": "2026-08-26T15:00:00Z",
+      "summary": "OpenAI published a security update covering the Hugging Face incident and its response, putting model and infrastructure security in focus.",
+      "feedKeys": ["openai", "safety"],
+      "feedLabels": ["OpenAI", "AI安全性"],
+      "locale": "en-US"
+    },
+    {
+      "id": "fb-openai-teachers-0826",
+      "title": "OpenAI expands ChatGPT for Teachers to more U.S. school districts",
+      "url": "https://openai.com/news/",
+      "sourceUrl": "https://openai.com/",
+      "source": "OpenAI",
+      "publishedAt": "2026-08-26T14:00:00Z",
+      "summary": "OpenAI announced broader availability of ChatGPT for Teachers, continuing the push to embed generative AI in education workflows.",
+      "feedKeys": ["openai"],
+      "feedLabels": ["OpenAI"],
+      "locale": "en-US"
+    },
+    {
+      "id": "fb-openai-jalapeno-0825",
+      "title": "OpenAI says Jalapeño chip shows strong AI inference speed and efficiency",
+      "url": "https://openai.com/news/",
+      "sourceUrl": "https://openai.com/",
+      "source": "OpenAI",
+      "publishedAt": "2026-08-25T17:00:00Z",
+      "summary": "OpenAI shared first results from its Jalapeño inference chip, emphasizing throughput, latency and efficiency as AI infrastructure becomes more vertically integrated.",
+      "feedKeys": ["openai", "infra"],
+      "feedLabels": ["OpenAI", "AIインフラ"],
+      "locale": "en-US"
+    },
+    {
+      "id": "fb-openai-stack-0825",
+      "title": "OpenAI outlines the full stack behind abundant intelligence",
+      "url": "https://openai.com/news/",
+      "sourceUrl": "https://openai.com/",
+      "source": "OpenAI",
+      "publishedAt": "2026-08-25T16:00:00Z",
+      "summary": "OpenAI described its view of the infrastructure stack required to scale AI systems, from compute and chips to software and deployment.",
+      "feedKeys": ["openai", "infra"],
+      "feedLabels": ["OpenAI", "AIインフラ"],
+      "locale": "en-US"
+    },
+    {
+      "id": "fb-deepmind-games-0821",
+      "title": "Google DeepMind looks from Atari to EVE Online for the next wave of AI and games research",
+      "url": "https://deepmind.google/blog/from-atari-to-eve-online-building-on-15-years-of-ai-research-in-games/",
+      "sourceUrl": "https://deepmind.google/",
+      "source": "Google DeepMind",
+      "publishedAt": "2026-08-21T12:00:00Z",
+      "summary": "Google DeepMind is partnering with game developers to prototype experiences that can also serve as research environments for advancing AI capabilities.",
+      "feedKeys": ["google", "research"],
+      "feedLabels": ["Google", "AI研究"],
+      "locale": "en-US"
+    },
+    {
+      "id": "fb-openai-intelligence-age-0820",
+      "title": "OpenAI introduces Intelligence Age",
+      "url": "https://openai.com/news/",
+      "sourceUrl": "https://openai.com/",
+      "source": "OpenAI",
+      "publishedAt": "2026-08-20T15:00:00Z",
+      "summary": "OpenAI introduced its Intelligence Age framing for how advanced AI may shape products, work and society.",
+      "feedKeys": ["openai", "global"],
+      "feedLabels": ["OpenAI", "AI総合"],
+      "locale": "en-US"
+    },
+    {
+      "id": "fb-anthropic-watermark-0814",
+      "title": "Anthropic explains how Claude text watermarking works",
+      "url": "https://www.anthropic.com/news/claude-text-watermark",
+      "sourceUrl": "https://www.anthropic.com/",
+      "source": "Anthropic",
+      "publishedAt": "2026-08-14T12:00:00Z",
+      "summary": "Anthropic described a text-watermarking approach intended to make it easier to detect when future Claude systems have contributed to generated text.",
+      "feedKeys": ["anthropic", "safety"],
+      "feedLabels": ["Anthropic", "AI安全性"],
+      "locale": "en-US"
+    },
+    {
+      "id": "fb-anthropic-opus5-0724",
+      "title": "Anthropic introduces Claude Opus 5",
+      "url": "https://www.anthropic.com/news",
+      "sourceUrl": "https://www.anthropic.com/",
+      "source": "Anthropic",
+      "publishedAt": "2026-07-24T12:00:00Z",
+      "summary": "Anthropic introduced Claude Opus 5, describing improvements for long-running agents, coding and professional work.",
+      "feedKeys": ["anthropic"],
+      "feedLabels": ["Anthropic"],
+      "locale": "en-US"
+    },
+    {
+      "id": "fb-deepmind-gemini37-0820",
+      "title": "Google DeepMind introduces Gemini 3.7 Flash",
+      "url": "https://deepmind.google/blog/",
+      "sourceUrl": "https://deepmind.google/",
+      "source": "Google DeepMind",
+      "publishedAt": "2026-08-20T10:00:00Z",
+      "summary": "Google DeepMind announced Gemini 3.7 Flash as part of its latest model updates, continuing competition around fast, general-purpose frontier models.",
+      "feedKeys": ["google"],
+      "feedLabels": ["Google"],
+      "locale": "en-US"
+    }
+  ]
+}

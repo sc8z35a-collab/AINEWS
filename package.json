@@ -1,0 +1,8 @@
+{
+  "name":"ai-brief-ultra",
+  "version":"1.0.0",
+  "private":true,
+  "description":"Zero-dependency AI news aggregator with trending and company pages",
+  "scripts":{"start":"node server.js","check":"node --check server.js && node --check public/common.js && node --check public/home.js && node --check public/company.js && node --check public/trending.js && node --check public/article.js"},
+  "engines":{"node":">=18"}
+}

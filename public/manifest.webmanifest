@@ -1,0 +1,9 @@
+{
+  "name":"AI BRIEF Ultra",
+  "short_name":"AI BRIEF",
+  "start_url":"/index.html",
+  "display":"standalone",
+  "background_color":"#f2efe8",
+  "theme_color":"#f2efe8",
+  "description":"最新AIニュースを自動収集・整理するニュースダッシュボード"
+}
