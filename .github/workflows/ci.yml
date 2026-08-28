@@ -11,7 +11,7 @@ permissions:
 jobs:
   verify:
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    timeout-minutes: 10
     strategy:
       matrix:
         node-version: [18, 22]
@@ -21,3 +21,12 @@ jobs:
         with:
           node-version: ${{ matrix.node-version }}
       - run: npm run verify
+      - name: Upload verification bundle on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: verification-diagnostics-node-${{ matrix.node-version }}
+          path: |
+            dist/
+            data/runtime-state.json
+          if-no-files-found: ignore

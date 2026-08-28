@@ -1,13 +1,17 @@
 {
   "name":"ai-brief-ultra",
-  "version":"1.1.0",
+  "version":"1.2.0",
   "private":true,
   "description":"Zero-dependency AI news aggregator with resilient caching, trending and company pages",
   "scripts":{
     "start":"node server.js",
-    "check":"node --check server.js && node --check public/common.js && node --check public/home.js && node --check public/company.js && node --check public/trending.js && node --check public/article.js && node --check public/sw.js && node --check test.js",
+    "icons":"node scripts/generate-icons.js",
+    "build:pages":"npm run icons && node scripts/build-pages.js",
+    "check":"node --check server.js && node --check public/common.js && node --check public/home.js && node --check public/company.js && node --check public/trending.js && node --check public/article.js && node --check public/about.js && node --check public/sw.js && node --check test.js && node --check integration-test.js && node --check pages-test.js && node --check scripts/build-pages.js && node --check scripts/generate-icons.js",
     "test":"node test.js",
-    "verify":"npm run check && npm test"
+    "test:integration":"node integration-test.js",
+    "test:pages":"node pages-test.js",
+    "verify":"npm run check && npm test && npm run test:integration && npm run test:pages"
   },
   "engines":{"node":">=18"}
 }

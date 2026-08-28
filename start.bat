@@ -15,6 +15,7 @@ if errorlevel 1 (
   exit /b 1
 )
 echo Starting AI BRIEF Ultra...
-start "" http://127.0.0.1:8787
+if not defined PORT set "PORT=8787"
+start "" /b powershell -NoProfile -WindowStyle Hidden -Command "$u='http://127.0.0.1:%PORT%'; for($i=0;$i -lt 100;$i++){try{if((Invoke-WebRequest -UseBasicParsing -TimeoutSec 1 ($u+'/api/health')).StatusCode -eq 200){Start-Process $u;break}}catch{};Start-Sleep -Milliseconds 200}"
 node server.js
 pause

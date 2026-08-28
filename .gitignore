@@ -1,3 +1,7 @@
 node_modules/
 data/cache.json
+data/runtime-state.json
+data/refresh.lock
+data/rate.lock
+dist/
 .DS_Store

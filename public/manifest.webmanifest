@@ -1,9 +1,15 @@
 {
   "name":"AI BRIEF Ultra",
   "short_name":"AI BRIEF",
-  "start_url":"/index.html",
+  "id":"./",
+  "start_url":"./index.html",
+  "scope":"./",
   "display":"standalone",
   "background_color":"#f2efe8",
   "theme_color":"#f2efe8",
-  "description":"最新AIニュースを自動収集・整理するニュースダッシュボード"
+  "description":"最新AIニュースを自動収集・整理するニュースダッシュボード",
+  "icons":[
+    {"src":"icons/icon-192.png","sizes":"192x192","type":"image/png","purpose":"any maskable"},
+    {"src":"icons/icon-512.png","sizes":"512x512","type":"image/png","purpose":"any maskable"}
+  ]
 }
