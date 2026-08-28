@@ -1,0 +1,2205 @@
+From d143bb0dc297d51527918917800deaee33e8ac98 Mon Sep 17 00:00:00 2001
+From: sc8z35a-collab <sc8z.35a@gmail.com>
+Date: Fri, 28 Aug 2026 09:11:03 +0900
+Subject: [PATCH] Fix-ultra-audit-findings
+
+---
+ .github/workflows/ci.yml    |  11 +-
+ .github/workflows/pages.yml |  38 ++
+ .gitignore                  |   4 +
+ Dockerfile                  |  14 +-
+ README.md                   |  36 +-
+ integration-test.js         |  46 +++
+ package.json                |  10 +-
+ pages-test.js               |  17 +
+ public/about.html           |   8 +-
+ public/about.js             |   2 +
+ public/anthropic.html       |   6 +-
+ public/article.html         |   6 +-
+ public/article.js           |   7 +-
+ public/common.js            |  30 +-
+ public/company.html         |   6 +-
+ public/company.js           |  25 +-
+ public/google.html          |   6 +-
+ public/home.js              |  17 +-
+ public/icons/icon-192.png   | Bin 0 -> 711 bytes
+ public/icons/icon-512.png   | Bin 0 -> 3372 bytes
+ public/index.html           |  12 +-
+ public/manifest.webmanifest |  10 +-
+ public/openai.html          |   6 +-
+ public/styles.css           |   7 +-
+ public/sw.js                |  29 +-
+ public/trending.html        |   6 +-
+ public/trending.js          |   6 +-
+ scripts/build-pages.js      |  35 ++
+ scripts/generate-icons.js   |  60 +++
+ scripts/upgrade-html.js     |  25 ++
+ server.js                   | 719 +++++++++++++++++++++++++++---------
+ start.bat                   |   3 +-
+ test.js                     | 184 ++++-----
+ 33 files changed, 1022 insertions(+), 369 deletions(-)
+ create mode 100644 .github/workflows/pages.yml
+ create mode 100644 integration-test.js
+ create mode 100644 pages-test.js
+ create mode 100644 public/about.js
+ create mode 100644 public/icons/icon-192.png
+ create mode 100644 public/icons/icon-512.png
+ create mode 100644 scripts/build-pages.js
+ create mode 100644 scripts/generate-icons.js
+ create mode 100644 scripts/upgrade-html.js
+
+diff --git a/.github/workflows/ci.yml b/.github/workflows/ci.yml
+index b9fd4ef..ca11199 100644
+--- a/.github/workflows/ci.yml
++++ b/.github/workflows/ci.yml
+@@ -11,7 +11,7 @@ permissions:
+ jobs:
+   verify:
+     runs-on: ubuntu-latest
+-    timeout-minutes: 5
++    timeout-minutes: 10
+     strategy:
+       matrix:
+         node-version: [18, 22]
+@@ -21,3 +21,12 @@ jobs:
+         with:
+           node-version: ${{ matrix.node-version }}
+       - run: npm run verify
++      - name: Upload verification bundle on failure
++        if: failure()
++        uses: actions/upload-artifact@v4
++        with:
++          name: verification-diagnostics-node-${{ matrix.node-version }}
++          path: |
++            dist/
++            data/runtime-state.json
++          if-no-files-found: ignore
+diff --git a/.github/workflows/pages.yml b/.github/workflows/pages.yml
+new file mode 100644
+index 0000000..fb289b9
+--- /dev/null
++++ b/.github/workflows/pages.yml
+@@ -0,0 +1,38 @@
++name: Deploy GitHub Pages
++
++on:
++  push:
++    branches: [main]
++  schedule:
++    - cron: '17 * * * *'
++  workflow_dispatch:
++
++permissions:
++  contents: read
++  pages: write
++  id-token: write
++
++concurrency:
++  group: pages
++  cancel-in-progress: true
++
++jobs:
++  build-and-deploy:
++    runs-on: ubuntu-latest
++    timeout-minutes: 10
++    environment:
++      name: github-pages
++      url: ${{ steps.deployment.outputs.page_url }}
++    steps:
++      - uses: actions/checkout@v4
++      - uses: actions/setup-node@v4
++        with:
++          node-version: 22
++      - run: npm run build:pages
++      - uses: actions/configure-pages@v5
++      - uses: actions/upload-pages-artifact@v5
++        with:
++          path: dist
++      - name: Deploy
++        id: deployment
++        uses: actions/deploy-pages@v5
+diff --git a/.gitignore b/.gitignore
+index a02aafa..194ccc7 100644
+--- a/.gitignore
++++ b/.gitignore
+@@ -1,3 +1,7 @@
+ node_modules/
+ data/cache.json
++data/runtime-state.json
++data/refresh.lock
++data/rate.lock
++dist/
+ .DS_Store
+diff --git a/Dockerfile b/Dockerfile
+index f9c22e8..276c17d 100644
+--- a/Dockerfile
++++ b/Dockerfile
+@@ -1,8 +1,14 @@
+-FROM node:22-alpine
++FROM node:22.23.2-alpine3.23@sha256:46825fbbd4e996a78b7a2cdc08d75e38a5a505bdab95dcda55605359bf124bc6
+ WORKDIR /app
+-COPY . .
+-RUN chown -R node:node /app
++COPY --chown=root:root . .
++RUN mkdir -p /app/data \
++    && cp /app/data/fallback.json /app/fallback.json \
++    && chown -R root:root /app \
++    && chown -R node:node /app/data
+ USER node
+-ENV HOST=0.0.0.0 PORT=8787 NODE_ENV=production
++ENV HOST=0.0.0.0 PORT=8787 NODE_ENV=production FALLBACK_FILE=/app/fallback.json
+ EXPOSE 8787
++VOLUME ["/app/data"]
++HEALTHCHECK --interval=30s --timeout=5s --start-period=15s --retries=3 \
++  CMD node -e "fetch('http://127.0.0.1:8787/api/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"
+ CMD ["node","server.js"]
+diff --git a/README.md b/README.md
+index cf7f4bf..b5b8d57 100644
+--- a/README.md
++++ b/README.md
+@@ -17,11 +17,11 @@
+ - OpenAI / Google / Anthropic / NVIDIA / Meta / Microsoft / xAI / Amazon・AWS の企業分類
+ - 記事詳細ページ `article.html?id=...`
+ - スコア式の関連記事表示
+-- 最大180件を対象にした簡易検索 / カテゴリ絞り込み / 並び替え
++- 最大180件を対象にした検索 / カテゴリ絞り込み / 並び替え（初期30件、追加表示方式）
+ - レート制限付き手動「更新」ボタン
+ - 10分キャッシュ + stale-while-refresh + 障害時指数バックオフ
+ - 外部取得障害時：ディスクキャッシュ → 内蔵フォールバック
+-- PWAシェル + 成功したAPIレスポンスのオフラインキャッシュ
++- PWAシェル + サイズ固定の静的ニューススナップショットによるオフライン表示
+ - RSS URL / 日時 / キャッシュschema / API数値パラメータの検証
+ - レスポンシブUI
+ - 広告SDK / 解析SDK / 外部フロントエンドライブラリなし
+@@ -79,10 +79,11 @@ API動作確認：
+ - `GET /api/news?company=openai`
+ - `GET /api/news?category=safety`
+ - `GET /api/news?q=Gemini`
+-- `GET /api/news?force=1&limit=1`
+ - `GET /api/trending?limit=15`
+ - `GET /api/article?id=ARTICLE_ID`
+ - `GET /api/meta`
++- `GET /api/snapshot`（PWA用の単一・全件スナップショット）
++- `POST /api/refresh`（同一オリジンのみ、送信元ごとの更新間隔制限あり）
+ 
+ 不正な `limit` / `offset` / 記事IDは、空データへ化けずHTTP 400を返します。
+ 
+@@ -111,7 +112,7 @@ Google News RSSは無料・認証不要ですが、提供仕様が将来変わ
+ - 大規模取得失敗: 最後の正常ディスクキャッシュを表示
+ - 初回かつ外部取得不可: `data/fallback.json` を表示
+ - フォールバック表示時は固定された古い生成日時をTTL判定に使わない
+-- PWAは成功した同一オリジンAPI GETを保存し、オフライン時に再利用
++- PWAはクエリごとのAPI応答を無制限に保存せず、公開用の単一ニューススナップショットだけを保存
+ - HTMLナビゲーションとJS/CSS等のアセットでオフラインfallbackを分離
+ 
+ 環境変数で変更できます。
+@@ -124,26 +125,38 @@ HARD_STALE_MS=86400000
+ FETCH_TIMEOUT_MS=8500
+ REFRESH_MIN_INTERVAL_MS=60000
+ FORCE_IP_INTERVAL_MS=300000
++DATA_DIR=./data
++TRUST_PROXY=0
++ENFORCE_HTTPS=0
++PUBLIC_ORIGIN=https://news.example.com
++FALLBACK_FILE=./data/fallback.json
+ ```
+ 
+ `HARD_STALE_MS` は互換用設定として保持しています。古いキャッシュを理由にユーザー応答を外部RSS取得待ちへ戻すことはありません。
+ 
+-外部公開する場合は `HOST=0.0.0.0` にしてください。手動force更新はグローバル間隔と送信元IP間隔の両方で制限されます。
++外部公開する場合は `HOST=0.0.0.0` にしてください。TLS終端プロキシの直下では `TRUST_PROXY=1`、HTTPアクセスをHTTPSへ転送する場合は `ENFORCE_HTTPS=1` と実際のHTTPS公開元を示す `PUBLIC_ORIGIN` を設定します。`TRUST_PROXY=1` は、信頼できるリバースプロキシからだけ接続される環境で使用してください。手動更新は送信元ごとの間隔で制限され、状態は `DATA_DIR` に保存されます。複数コンテナで動かす場合は、全コンテナから同じ `DATA_DIR` を共有してください。別ホスト構成では、共有ファイルシステムまたは外部の分散ロック・レート制限基盤が必要です。
++
++## GitHub Pages
++
++`.github/workflows/pages.yml` は毎時、RSS取得・重複除去・ランキング生成を実行し、静的な `dist/` をGitHub Pagesへ公開します。ブラウザはサーバーAPIの代わりに `data/news.json` を読み込むため、Pages上でもニュース一覧・企業別・急上昇・記事詳細が動作します。
++
++リポジトリの **Settings → Pages → Build and deployment → Source** は **GitHub Actions** を選択してください。初回公開はActionsの「Deploy GitHub Pages」を手動実行できます。
+ 
+ ## Docker
+ 
+ ```bash
+ docker build -t ai-brief-ultra .
+-docker run --rm -p 8787:8787 ai-brief-ultra
++docker volume create ai-brief-data
++docker run --rm -p 8787:8787 -v ai-brief-data:/app/data ai-brief-ultra
+ ```
+ 
+-コンテナ内ではrootではなくNode.js標準の `node` ユーザーでアプリを実行します。
++コンテナ内ではrootではなくNode.js標準の `node` ユーザーでアプリを実行します。アプリ本体は読み取り専用権限で、`/app/data` だけを書き込み可能にしています。イメージにはヘルスチェックがあり、SIGTERM時は受付停止・状態保存を行って終了します。
+ 
+ ## 公開運用時の注意
+ 
+ このプロジェクトは記事本文を転載せず、フィードから得られるタイトル、配信元、短い説明、時刻、分類情報を整理し、配信元へリンクします。
+ 
+-RSSから得た外部URLはHTTP/HTTPSのみ許可します。配信フィードが記事固有URLではなくニュース一覧URLを返す場合、画面上でも「配信元サイト」と明示します。
++RSSから得た外部URLは、認証情報を含まない公開HTTPS URLのみ許可します。Google Newsの中継URLは、画面上でも「Google News経由」と明示します。
+ 
+ 公開サービスとして運用する場合は、利用する各ニュース配信元・アグリゲーションサービスの利用条件、robots、商標表示、引用要件、アクセス頻度制限を別途確認してください。
+ 
+@@ -155,11 +168,18 @@ Google News RSSは試作や低頻度用途に便利ですが、ニュースAPI
+ ai-news-ultra/
+ ├─ server.js
+ ├─ test.js
++├─ integration-test.js
++├─ pages-test.js
+ ├─ package.json
+ ├─ start.bat
+ ├─ start.sh
+ ├─ Dockerfile
+ ├─ .github/workflows/ci.yml
++├─ .github/workflows/pages.yml
++├─ scripts/
++│  ├─ build-pages.js
++│  ├─ generate-icons.js
++│  └─ upgrade-html.js
+ ├─ data/
+ │  ├─ fallback.json
+ │  └─ cache.json        # 初回ライブ取得成功後に自動生成
+diff --git a/integration-test.js b/integration-test.js
+new file mode 100644
+index 0000000..e7185cd
+--- /dev/null
++++ b/integration-test.js
+@@ -0,0 +1,46 @@
++'use strict';
++
++const assert = require('node:assert/strict');
++const fs = require('node:fs');
++const fsp = fs.promises;
++const os = require('node:os');
++const path = require('node:path');
++const net = require('node:net');
++const { spawn } = require('node:child_process');
++
++async function freePort() { return new Promise((resolve,reject)=>{const s=net.createServer();s.once('error',reject);s.listen(0,'127.0.0.1',()=>{const port=s.address().port;s.close(()=>resolve(port))})}); }
++async function waitFor(url, timeout=12000) { const until=Date.now()+timeout;let last;while(Date.now()<until){try{const r=await fetch(url);if(r.status<500)return r}catch(e){last=e}await new Promise(r=>setTimeout(r,100))}throw last||new Error('server readiness timeout'); }
++
++(async()=>{
++  const temp=await fsp.mkdtemp(path.join(os.tmpdir(),'ainews-integration-'));
++  const port=await freePort();
++  const now=new Date().toISOString();
++  const cache={schema:3,generatedAt:now,fetchedAt:now,mode:'live',degraded:false,sourceStats:[{key:'test',label:'Test',ok:true,count:1}],articles:[{id:'test-article',title:'OpenAI launches a test model',url:'https://example.com/article',sourceUrl:'https://example.com/',source:'Example',publishedAt:new Date(Date.now()-60000).toISOString(),summary:'Integration fixture',feedKeys:['openai'],feedLabels:['OpenAI'],locale:'en-US',origin:'live',sourceNames:['Example'],mentionCount:1}],trending:[]};
++  await fsp.copyFile(path.join(__dirname,'data','fallback.json'),path.join(temp,'fallback.json'));
++  await fsp.writeFile(path.join(temp,'cache.json'),JSON.stringify(cache),'utf8');
++  const before=(await fsp.stat(path.join(temp,'cache.json'))).mtimeMs;
++  const child=spawn(process.execPath,['server.js'],{cwd:__dirname,env:{...process.env,PORT:String(port),HOST:'127.0.0.1',DATA_DIR:temp,DISABLE_NETWORK:'1',CACHE_TTL_MS:'600000',FORCE_IP_INTERVAL_MS:'10000',REFRESH_MIN_INTERVAL_MS:'10000'},stdio:['ignore','pipe','pipe']});
++  let logs='';child.stdout.on('data',x=>{logs+=x});child.stderr.on('data',x=>{logs+=x});
++  try{
++    const base=`http://127.0.0.1:${port}`;
++    const health=await waitFor(`${base}/api/health`);assert.equal(health.status,200);
++    const response=await fetch(`${base}/api/news?limit=1`,{headers:{'accept-encoding':'gzip;q=0, *;q=1'}});assert.equal(response.status,200);assert.equal(response.headers.get('content-encoding'),null);assert(response.headers.get('content-security-policy')?.includes("frame-ancestors 'none'"));assert(response.headers.get('x-request-id'));
++    const news=await response.json();assert.equal(news.items.length,1);assert.equal(news.meta.refreshStatus,'none');
++    const sideEffectFree=await (await fetch(`${base}/api/news?force=1&limit=1`)).json();assert.equal(sideEffectFree.meta.refreshStatus,'none');assert.equal(sideEffectFree.meta.generatedAt,now);
++    const head=await fetch(`${base}/api/news?limit=1`,{method:'HEAD'});assert.equal(head.status,200);assert(Number(head.headers.get('content-length'))>0);
++    const snapshotResponse=await fetch(`${base}/api/snapshot`);assert.equal(snapshotResponse.status,200);assert.equal(snapshotResponse.headers.get('cache-control'),'private, max-age=0, must-revalidate');assert.equal((await snapshotResponse.json()).articles.length,1);
++    const servedWorker=await fetch(`${base}/sw.js`);assert.equal(servedWorker.headers.get('cache-control'),'no-cache');assert(!(await servedWorker.text()).includes('__ASSET_VERSION__'));
++    const wrongMethod=await fetch(`${base}/api/refresh`);assert.equal(wrongMethod.status,405);assert.equal(wrongMethod.headers.get('allow'),'POST');
++    const crossOrigin=await fetch(`${base}/api/refresh`,{method:'POST',headers:{origin:'https://evil.example'}});assert.equal(crossOrigin.status,403);
++    const bodyRejected=await fetch(`${base}/api/refresh`,{method:'POST',headers:{origin:base,'content-type':'application/json'},body:'{}'});assert.equal(bodyRejected.status,413);
++    const refreshed=await fetch(`${base}/api/refresh`,{method:'POST',headers:{origin:base}});assert.equal(refreshed.status,200);const refreshBody=await refreshed.json();assert(['degraded','updated'].includes(refreshBody.meta.refreshStatus));
++    const throttled=await fetch(`${base}/api/refresh`,{method:'POST',headers:{origin:base}});assert.equal(throttled.status,429);
++    const after=(await fsp.stat(path.join(temp,'cache.json'))).mtimeMs;assert.equal(after,before,'fresh startup or failed partial refresh rewrote the healthy cache');
++    console.log('✓ HTTP, security headers, side-effect-free GET, cache protection and throttling');
++  }finally{
++    child.kill('SIGTERM');
++    await Promise.race([new Promise(resolve=>child.once('exit',resolve)),new Promise(resolve=>setTimeout(resolve,3000))]);
++    const resolved=path.resolve(temp),tmpRoot=path.resolve(os.tmpdir());
++    if(resolved.startsWith(tmpRoot+path.sep)&&path.basename(resolved).startsWith('ainews-integration-'))await fsp.rm(resolved,{recursive:true,force:true});
++  }
++})().catch(err=>{console.error(err);process.exitCode=1});
+diff --git a/package.json b/package.json
+index f65016f..0303a83 100644
+--- a/package.json
++++ b/package.json
+@@ -1,13 +1,17 @@
+ {
+   "name":"ai-brief-ultra",
+-  "version":"1.1.0",
++  "version":"1.2.0",
+   "private":true,
+   "description":"Zero-dependency AI news aggregator with resilient caching, trending and company pages",
+   "scripts":{
+     "start":"node server.js",
+-    "check":"node --check server.js && node --check public/common.js && node --check public/home.js && node --check public/company.js && node --check public/trending.js && node --check public/article.js && node --check public/sw.js && node --check test.js",
++    "icons":"node scripts/generate-icons.js",
++    "build:pages":"npm run icons && node scripts/build-pages.js",
++    "check":"node --check server.js && node --check public/common.js && node --check public/home.js && node --check public/company.js && node --check public/trending.js && node --check public/article.js && node --check public/about.js && node --check public/sw.js && node --check test.js && node --check integration-test.js && node --check pages-test.js && node --check scripts/build-pages.js && node --check scripts/generate-icons.js",
+     "test":"node test.js",
+-    "verify":"npm run check && npm test"
++    "test:integration":"node integration-test.js",
++    "test:pages":"node pages-test.js",
++    "verify":"npm run check && npm test && npm run test:integration && npm run test:pages"
+   },
+   "engines":{"node":">=18"}
+ }
+diff --git a/pages-test.js b/pages-test.js
+new file mode 100644
+index 0000000..c67c002
+--- /dev/null
++++ b/pages-test.js
+@@ -0,0 +1,17 @@
++'use strict';
++
++const assert=require('node:assert/strict');
++const fs=require('node:fs');
++const path=require('node:path');
++const {spawnSync}=require('node:child_process');
++const root=__dirname,publicDir=path.join(root,'public');
++const pages=fs.readdirSync(publicDir).filter(x=>x.endsWith('.html'));
++for(const page of pages){const html=fs.readFileSync(path.join(publicDir,page),'utf8');assert(html.includes('id="main-content"'),`${page} has no main target`);assert(html.includes('class="skip-link"'),`${page} has no skip link`);assert(html.includes('<noscript>'),`${page} has no noscript fallback`);assert(!/<script>(?!\s*<)/.test(html),`${page} contains an inline script`);assert(!html.includes('style='),`${page} contains inline styles`)}
++const manifest=JSON.parse(fs.readFileSync(path.join(publicDir,'manifest.webmanifest'),'utf8'));assert.equal(manifest.start_url,'./index.html');assert.equal(manifest.scope,'./');assert.equal(manifest.icons.length,2);
++for(const icon of manifest.icons){const data=fs.readFileSync(path.join(publicDir,icon.src));assert.equal(data.subarray(1,4).toString(),'PNG')}
++const sw=fs.readFileSync(path.join(publicDir,'sw.js'),'utf8');assert(sw.includes('__ASSET_VERSION__'));assert(!sw.includes("'/index.html'"));assert(sw.includes("if(url.pathname.includes('/api/'))return"));assert(sw.includes("fetch(scopeUrl('./data/news.json'),{cache:'reload'})"));assert(sw.includes("headers.set('x-ainews-cache','offline')"));
++assert(fs.readFileSync(path.join(publicDir,'common.js'),'utf8').includes('staticApi'));
++const pagesWorkflow=fs.readFileSync(path.join(root,'.github','workflows','pages.yml'),'utf8');assert(pagesWorkflow.includes('actions/deploy-pages@v5'));assert(pagesWorkflow.includes('actions/upload-pages-artifact@v5'));
++const built=spawnSync(process.execPath,['scripts/build-pages.js'],{cwd:root,env:{...process.env,DISABLE_NETWORK:'1'},encoding:'utf8'});if(built.status!==0)throw new Error(built.stderr||built.stdout||'Pages build failed');
++assert(fs.existsSync(path.join(root,'dist','index.html')));const snapshot=JSON.parse(fs.readFileSync(path.join(root,'dist','data','news.json'),'utf8'));assert(snapshot.articles.length>0);assert(!fs.readFileSync(path.join(root,'dist','sw.js'),'utf8').includes('__ASSET_VERSION__'));
++console.log(`✓ GitHub Pages bundle, PWA scope, icons and ${pages.length} accessible HTML pages`);
+diff --git a/public/about.html b/public/about.html
+index b7f4a83..3b0af77 100644
+--- a/public/about.html
++++ b/public/about.html
+@@ -1,4 +1,4 @@
+-<!doctype html><html lang="ja"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="theme-color" content="#f2efe8"><link rel="stylesheet" href="styles.css"><title>このサイトについて — AI BRIEF Ultra</title></head><body>
+-<div class="topline"><div class="wrap"><div class="status-inline"><span id="statusDot" class="status-dot"></span><span id="statusText">自動取得を確認中…</span></div><div id="globalUpdated" class="top-small">最新情報を読み込み中</div></div></div><header><div class="wrap nav"><a class="brand" href="index.html"><span class="brandmark">AI</span><span>AI BRIEF<span class="brand-sub">ULTRA EDITION</span></span></a><button id="menuBtn" class="menu-btn" aria-expanded="false">☰</button><nav id="navLinks" class="navlinks"><a href="index.html">最新</a><a href="trending.html">急上昇</a><a href="openai.html">OpenAI</a><a href="google.html">Google</a><a href="anthropic.html">Anthropic</a><a class="active" href="about.html">このサイトについて</a><button id="refreshBtn" class="refresh-btn">↻ 更新</button></nav></div></header>
+-<main><div class="wrap"><section class="page-hero"><div class="page-hero-inner"><div><div class="kicker">System Design</div><h1>どう動いているか</h1><p>無料・キー不要でも動くこと、ニュース本文を無断転載しないこと、取得失敗で真っ白にならないことを優先した構成です。</p></div><div class="page-badge">NO NEON / EDITORIAL UI</div></div></section><section class="section info-grid"><div class="info-card"><h2>1. 自動ニュース取得</h2><p>Node.jsサーバーがGoogle News RSSを複数クエリで並列取得します。総合AI、日本語圏、OpenAI、Google / DeepMind、Anthropic、インフラ、安全性、研究を別々に検索し、結果を統合します。</p></div><div class="info-card"><h2>2. 重複除去</h2><p>タイトルを正規化して完全重複を統合します。急上昇判定ではさらに単語集合の類似度を使い、少し違う見出しの同一ニュースも近似クラスタとして扱います。</p></div><div class="info-card"><h2>3. 急上昇スコア</h2><p>記事の鮮度、近似記事を報じた媒体数、複数検索テーマで拾われた広がり、同一クラスタの記事量を加点し、相対ランキングを作ります。</p></div><div class="info-card"><h2>4. キャッシュ / 障害耐性</h2><p>通常は10分キャッシュ。期限切れ直後は古いデータを即返しつつ裏で再取得します。外部取得が大きく失敗した場合はディスクキャッシュ、それも無ければ内蔵フォールバックへ切り替えます。</p></div><div class="info-card"><h2>5. 記事詳細</h2><p>記事本文そのものは転載せず、タイトル、配信元、取得できた短い説明、分類、関連記事、急上昇情報を表示します。原文は配信元へ直接移動して読みます。</p></div><div class="info-card"><h2>6. 企業別ページ</h2><p>OpenAI / Google / Anthropicはタイトルと配信元に含まれる企業・製品キーワードで自動分類します。GPT、ChatGPT、Gemini、DeepMind、Claudeなども判定対象です。</p></div><div class="info-card"><h2>7. プライバシー</h2><p>この配布版は広告SDK、解析SDK、トラッカーを入れていません。サーバーへの通常のHTTPアクセス以外に、ブラウザ側でユーザーデータを外部送信する処理はありません。</p></div><div class="info-card"><h2>8. デザイン</h2><p>暖色系の紙色、チャコール、くすんだ青、錆色を使用。蛍光色、発光、ネオングラデーションは使わず、新聞・リサーチダッシュボード寄りのUIにしています。</p></div></section></div></main>
+-<footer><div class="wrap footer-inner"><div class="footer-copy">本サイトは個人利用・プロトタイプ向けです。公開運用する場合は各配信元の利用条件、robots、商標、引用要件、負荷制限も確認してください。</div><div class="footer-links"><a href="index.html">最新</a><a href="trending.html">急上昇</a></div></div></footer><div id="toast" class="toast"></div><script src="common.js"></script><script>api('/api/news?limit=1').then(x=>updateGlobalStatus(x.meta)).catch(()=>{});</script></body></html>
++<!doctype html><html lang="ja"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="theme-color" content="#f2efe8"><link rel="manifest" href="manifest.webmanifest"><link rel="icon" href="icons/icon-192.png"><link rel="stylesheet" href="styles.css"><title>このサイトについて — AI BRIEF Ultra</title></head><body><a class="skip-link" href="#main-content">本文へ移動</a><noscript><div class="noscript">このサイトのニュース表示にはJavaScriptが必要です。</div></noscript>
++<div class="topline"><div class="wrap"><div class="status-inline"><span id="statusDot" class="status-dot"></span><span id="statusText">自動取得を確認中…</span></div><div id="globalUpdated" class="top-small">最新情報を読み込み中</div></div></div><header><div class="wrap nav"><a class="brand" href="index.html"><span class="brandmark">AI</span><span>AI BRIEF<span class="brand-sub">ULTRA EDITION</span></span></a><button id="menuBtn" class="menu-btn" type="button" aria-expanded="false" aria-label="メニュー">☰</button><nav id="navLinks" class="navlinks"><a href="index.html">最新</a><a href="trending.html">急上昇</a><a href="openai.html">OpenAI</a><a href="google.html">Google</a><a href="anthropic.html">Anthropic</a><a class="active" href="about.html">このサイトについて</a><button id="refreshBtn" class="refresh-btn" type="button">↻ 更新</button></nav></div></header>
++<main id="main-content" tabindex="-1"><div class="wrap"><section class="page-hero"><div class="page-hero-inner"><div><div class="kicker">System Design</div><h1>どう動いているか</h1><p>無料・キー不要でも動くこと、ニュース本文を無断転載しないこと、取得失敗で真っ白にならないことを優先した構成です。</p></div><div class="page-badge">NO NEON / EDITORIAL UI</div></div></section><section class="section info-grid"><div class="info-card"><h2>1. 自動ニュース取得</h2><p>Node.jsサーバーがGoogle News RSSを複数クエリで並列取得します。総合AI、日本語圏、OpenAI、Google / DeepMind、Anthropic、インフラ、安全性、研究を別々に検索し、結果を統合します。</p></div><div class="info-card"><h2>2. 重複除去</h2><p>タイトルを正規化して完全重複を統合します。急上昇判定ではさらに単語集合の類似度を使い、少し違う見出しの同一ニュースも近似クラスタとして扱います。</p></div><div class="info-card"><h2>3. 急上昇スコア</h2><p>記事の鮮度、近似記事を報じた媒体数、複数検索テーマで拾われた広がり、同一クラスタの記事量を加点し、相対ランキングを作ります。</p></div><div class="info-card"><h2>4. キャッシュ / 障害耐性</h2><p>通常は10分キャッシュ。期限切れ直後は古いデータを即返しつつ裏で再取得します。外部取得が大きく失敗した場合はディスクキャッシュ、それも無ければ内蔵フォールバックへ切り替えます。</p></div><div class="info-card"><h2>5. 記事詳細</h2><p>記事本文そのものは転載せず、タイトル、配信元、取得できた短い説明、分類、関連記事、急上昇情報を表示します。原文は配信元へ直接移動して読みます。</p></div><div class="info-card"><h2>6. 企業別ページ</h2><p>OpenAI / Google / Anthropicはタイトルと配信元に含まれる企業・製品キーワードで自動分類します。GPT、ChatGPT、Gemini、DeepMind、Claudeなども判定対象です。</p></div><div class="info-card"><h2>7. プライバシー</h2><p>この配布版は広告SDK、解析SDK、トラッカーを入れていません。サーバーへの通常のHTTPアクセス以外に、ブラウザ側でユーザーデータを外部送信する処理はありません。</p></div><div class="info-card"><h2>8. デザイン</h2><p>暖色系の紙色、チャコール、くすんだ青、錆色を使用。蛍光色、発光、ネオングラデーションは使わず、新聞・リサーチダッシュボード寄りのUIにしています。</p></div></section></div></main>
++<footer><div class="wrap footer-inner"><div class="footer-copy">本サイトは個人利用・プロトタイプ向けです。公開運用する場合は各配信元の利用条件、robots、商標、引用要件、負荷制限も確認してください。</div><div class="footer-links"><a href="index.html">最新</a><a href="trending.html">急上昇</a></div></div></footer><div id="toast" class="toast"></div><script src="common.js"></script><script src="about.js"></script></body></html>
+diff --git a/public/about.js b/public/about.js
+new file mode 100644
+index 0000000..3a1d7ce
+--- /dev/null
++++ b/public/about.js
+@@ -0,0 +1,2 @@
++'use strict';
++api('/api/news?limit=1').then(x=>updateGlobalStatus(x.meta)).catch(()=>{});
+diff --git a/public/anthropic.html b/public/anthropic.html
+index d335a36..e8dd03d 100644
+--- a/public/anthropic.html
++++ b/public/anthropic.html
+@@ -1,5 +1,5 @@
+-<!doctype html><html lang="ja"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="theme-color" content="#f2efe8"><link rel="stylesheet" href="styles.css"><title>Anthropic 最新ニュース — AI BRIEF Ultra</title></head><body>
++<!doctype html><html lang="ja"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="theme-color" content="#f2efe8"><link rel="manifest" href="manifest.webmanifest"><link rel="icon" href="icons/icon-192.png"><link rel="stylesheet" href="styles.css"><title>Anthropic 最新ニュース — AI BRIEF Ultra</title></head><body><a class="skip-link" href="#main-content">本文へ移動</a><noscript><div class="noscript">このサイトのニュース表示にはJavaScriptが必要です。</div></noscript>
+ <div class="topline"><div class="wrap"><div class="status-inline"><span id="statusDot" class="status-dot"></span><span id="statusText">自動取得を確認中…</span></div><div id="globalUpdated" class="top-small">最新情報を読み込み中</div></div></div>
+-<header><div class="wrap nav"><a class="brand" href="index.html"><span class="brandmark">AI</span><span>AI BRIEF<span class="brand-sub">ULTRA EDITION</span></span></a><button id="menuBtn" class="menu-btn" aria-expanded="false">☰</button><nav id="navLinks" class="navlinks"><a href="index.html">最新</a><a href="trending.html">急上昇</a><a href="openai.html">OpenAI</a><a href="google.html">Google</a><a href="anthropic.html">Anthropic</a><a href="about.html">このサイトについて</a><button id="refreshBtn" class="refresh-btn">↻ 更新</button></nav></div></header>
+-<main><div class="wrap"><section class="page-hero"><div class="page-hero-inner"><div><div class="kicker">Company Watch</div><h1 id="companyTitle">Company</h1><p id="companyDesc">企業別の最新AIニュースを自動抽出します。</p></div><div id="companyBadge" class="page-badge">読込中</div></div></section><section class="section"><div class="toolbar"><label class="searchbox"><span class="sr-only">検索</span><input id="searchInput" type="search" placeholder="この企業のニュースを検索"></label><select id="sortSelect" class="select"><option value="latest">新着順</option><option value="source">配信元順</option></select><div id="resultCount" class="countbox">読込中</div></div><div id="newsGrid" class="news-grid"></div></section></div></main>
++<header><div class="wrap nav"><a class="brand" href="index.html"><span class="brandmark">AI</span><span>AI BRIEF<span class="brand-sub">ULTRA EDITION</span></span></a><button id="menuBtn" class="menu-btn" type="button" aria-expanded="false" aria-label="メニュー">☰</button><nav id="navLinks" class="navlinks"><a href="index.html">最新</a><a href="trending.html">急上昇</a><a href="openai.html">OpenAI</a><a href="google.html">Google</a><a href="anthropic.html">Anthropic</a><a href="about.html">このサイトについて</a><button id="refreshBtn" class="refresh-btn" type="button">↻ 更新</button></nav></div></header>
++<main id="main-content" tabindex="-1"><div class="wrap"><section class="page-hero"><div class="page-hero-inner"><div><div class="kicker">Company Watch</div><h1 id="companyTitle">Company</h1><p id="companyDesc">企業別の最新AIニュースを自動抽出します。</p></div><div id="companyBadge" class="page-badge">読込中</div></div></section><section class="section"><div class="toolbar"><label class="searchbox"><span class="sr-only">検索</span><input id="searchInput" type="search" placeholder="この企業のニュースを検索"></label><select id="sortSelect" class="select"><option value="latest">新着順</option><option value="source">配信元順</option></select><div id="resultCount" class="countbox" role="status" aria-live="polite" aria-atomic="true">読込中</div></div><div id="newsGrid" class="news-grid" aria-live="polite"></div></section></div></main>
+ <footer><div class="wrap footer-inner"><div class="footer-copy">AI BRIEF Ultra — 企業名や製品名を含むニュースを自動分類しています。分類は完全ではないため、重要判断では必ず原文をご確認ください。</div><div class="footer-links"><a href="index.html">最新</a><a href="trending.html">急上昇</a></div></div></footer><div id="toast" class="toast"></div><script src="common.js"></script><script src="company.js"></script></body></html>
+diff --git a/public/article.html b/public/article.html
+index 5d2a2ce..9ae2678 100644
+--- a/public/article.html
++++ b/public/article.html
+@@ -1,4 +1,4 @@
+-<!doctype html><html lang="ja"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="theme-color" content="#f2efe8"><link rel="stylesheet" href="styles.css"><title>記事詳細 — AI BRIEF Ultra</title></head><body>
+-<div class="topline"><div class="wrap"><div class="status-inline"><span id="statusDot" class="status-dot"></span><span id="statusText">自動取得を確認中…</span></div><div id="globalUpdated" class="top-small">最新情報を読み込み中</div></div></div><header><div class="wrap nav"><a class="brand" href="index.html"><span class="brandmark">AI</span><span>AI BRIEF<span class="brand-sub">ULTRA EDITION</span></span></a><button id="menuBtn" class="menu-btn" aria-expanded="false">☰</button><nav id="navLinks" class="navlinks"><a href="index.html">最新</a><a href="trending.html">急上昇</a><a href="openai.html">OpenAI</a><a href="google.html">Google</a><a href="anthropic.html">Anthropic</a><a href="about.html">このサイトについて</a><button id="refreshBtn" class="refresh-btn">↻ 更新</button></nav></div></header>
+-<main><div class="wrap"><div id="articleShell" class="article-shell"><article class="article-main"><div class="crumb"><a href="index.html">最新ニュース</a> / 記事詳細</div><div class="skeleton sk-line short"></div><div class="skeleton sk-line big"></div><div class="skeleton sk-line mid"></div><div class="skeleton sk-line"></div></article><aside class="article-aside"><div class="aside-title">関連記事</div><div class="skeleton sk-line"></div><div class="skeleton sk-line mid"></div></aside></div></div></main>
++<!doctype html><html lang="ja"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="theme-color" content="#f2efe8"><link rel="manifest" href="manifest.webmanifest"><link rel="icon" href="icons/icon-192.png"><link rel="stylesheet" href="styles.css"><title>記事詳細 — AI BRIEF Ultra</title></head><body><a class="skip-link" href="#main-content">本文へ移動</a><noscript><div class="noscript">このサイトのニュース表示にはJavaScriptが必要です。</div></noscript>
++<div class="topline"><div class="wrap"><div class="status-inline"><span id="statusDot" class="status-dot"></span><span id="statusText">自動取得を確認中…</span></div><div id="globalUpdated" class="top-small">最新情報を読み込み中</div></div></div><header><div class="wrap nav"><a class="brand" href="index.html"><span class="brandmark">AI</span><span>AI BRIEF<span class="brand-sub">ULTRA EDITION</span></span></a><button id="menuBtn" class="menu-btn" type="button" aria-expanded="false" aria-label="メニュー">☰</button><nav id="navLinks" class="navlinks"><a href="index.html">最新</a><a href="trending.html">急上昇</a><a href="openai.html">OpenAI</a><a href="google.html">Google</a><a href="anthropic.html">Anthropic</a><a href="about.html">このサイトについて</a><button id="refreshBtn" class="refresh-btn" type="button">↻ 更新</button></nav></div></header>
++<main id="main-content" tabindex="-1"><div class="wrap"><div id="articleShell" class="article-shell"><article class="article-main"><div class="crumb"><a href="index.html">最新ニュース</a> / 記事詳細</div><div class="skeleton sk-line short"></div><div class="skeleton sk-line big"></div><div class="skeleton sk-line mid"></div><div class="skeleton sk-line"></div></article><aside class="article-aside"><div class="aside-title">関連記事</div><div class="skeleton sk-line"></div><div class="skeleton sk-line mid"></div></aside></div></div></main>
+ <footer><div class="wrap footer-inner"><div class="footer-copy">AI BRIEF Ultraは記事本文を転載しません。詳細な内容、訂正、更新は必ず配信元の記事をご確認ください。</div><div class="footer-links"><a href="index.html">最新</a><a href="trending.html">急上昇</a></div></div></footer><div id="toast" class="toast"></div><script src="common.js"></script><script src="article.js"></script></body></html>
+diff --git a/public/article.js b/public/article.js
+index e993b1a..10edd98 100644
+--- a/public/article.js
++++ b/public/article.js
+@@ -1,3 +1,6 @@
++'use strict';
++
+ const id=(new URLSearchParams(location.search).get('id')||'').trim();
+-function render(d){const a=d?.article;if(!a)throw new Error('missing article');const cat=primaryCategory(a);document.title=`${a.title} — AI BRIEF Ultra`;const companies=Array.isArray(a.companies)?a.companies:[];const categories=Array.isArray(a.categories)?a.categories:[];const companyLinks=companies.filter(c=>KNOWN_COMPANIES.has(c)).map(c=>`<a class="meta-pill" style="text-decoration:none" href="${companyHref(c)}">${esc(COMPANY_LABELS[c]||c)}</a>`).join('');const cats=categories.map(c=>`<span class="meta-pill">${esc(CATEGORY_LABELS[c]||c)}</span>`).join('');const trend=d.cluster?`<span class="meta-pill">急上昇 ${Number.isFinite(Number(d.cluster.score))?Math.round(Number(d.cluster.score)):'—'} / 124</span><span class="meta-pill">${Number(d.cluster.sourceCount)||0}媒体で近似報道</span>`:'';const related=(Array.isArray(d.related)?d.related:[]).map(x=>`<div class="aside-item"><a href="${articleHref(x.id)}">${esc(trim(x.title,95))}</a><span>${esc(x.source||'配信元不明')} · ${esc(ago(x.publishedAt))}</span></div>`).join('')||'<div class="aside-item">関連記事はありません。</div>';const external=safeExternalUrl(a.url);const linkText=external?(isGenericArticleUrl(external)?'配信元サイトを開く ↗':'配信元の記事を開く ↗'):'';const sourceButton=external?`<a class="original-btn" href="${esc(external)}" target="_blank" rel="noopener noreferrer">${linkText}</a>`:'<span class="meta-pill">安全な原文URLを確認できません</span>';const mode=d.meta?.mode||a.origin||'fallback';const modeText=mode==='live'&&!d.meta?.degraded?'LIVE FEED':mode==='live'?'LIVE / DEGRADED':mode==='stale-cache'?'CACHE':'FALLBACK';$('#articleShell').innerHTML=`<article class="article-main"><div class="crumb"><a href="index.html">最新ニュース</a> / ${esc(CATEGORY_LABELS[cat]||cat)}</div><div class="kicker">${esc(a.source||'配信元不明')}</div><h1>${esc(a.title)}</h1><p class="article-deck">${esc(a.summary||'配信フィードには十分な要約が含まれていません。以下の配信元リンクから詳細をご確認ください。')}</p><div class="article-meta"><span class="meta-pill">${esc(fmtDate(a.publishedAt,{time:true}))}</span>${companyLinks}${cats}${trend}<span class="meta-pill">${esc(modeText)}</span></div><section class="article-summary"><h2>AI BRIEF NOTE</h2><p>このページは取得した公開フィード情報を整理した記事ハブです。タイトル、配信元、時刻、カテゴリ、関連記事、急上昇情報をまとめています。</p></section>${sourceButton}<p class="legal-note">原文は外部サイトで開きます。AI BRIEF Ultraは原記事本文を保存・転載しません。</p></article><aside class="article-aside"><div class="aside-title">関連記事</div>${related}</aside>`;updateGlobalStatus(d.meta)}
+-async function init(){if(!/^[a-zA-Z0-9_-]{4,80}$/.test(id)){$('#articleShell').innerHTML='<div class="errorbox"><strong>記事IDが不正です</strong><a href="index.html">トップへ戻る</a></div>';return}try{render(await api(`/api/article?id=${encodeURIComponent(id)}`))}catch(e){const offline=!navigator.onLine;$('#articleShell').innerHTML=`<div class="errorbox"><strong>記事を表示できません</strong>${offline?'オフラインキャッシュにこの記事が保存されていない可能性があります。':'ニュース更新により古い記事IDが消えたか、取得に失敗した可能性があります。'}<br><a href="index.html">最新ニュースへ戻る</a></div>`}}init();
++function render(d){const a=d?.article;if(!a)throw new Error('missing article');const cat=primaryCategory(a);document.title=`${a.title} — AI BRIEF Ultra`;const companies=Array.isArray(a.companies)?a.companies:[];const categories=Array.isArray(a.categories)?a.categories:[];const companyLinks=companies.filter(c=>KNOWN_COMPANIES.has(c)).map(c=>`<a class="meta-pill" href="${companyHref(c)}">${esc(COMPANY_LABELS[c]||c)}</a>`).join('');const cats=categories.map(c=>`<span class="meta-pill">${esc(CATEGORY_LABELS[c]||c)}</span>`).join('');const trend=d.cluster?`<span class="meta-pill">急上昇 ${Number.isFinite(Number(d.cluster.score))?Math.round(Number(d.cluster.score)):'—'} / 124</span><span class="meta-pill">${Number(d.cluster.sourceCount)||0}媒体で近似報道</span>`:'';const related=(Array.isArray(d.related)?d.related:[]).map(x=>`<div class="aside-item"><a href="${articleHref(x.id)}">${esc(trim(x.title,95))}</a><span>${esc(x.source||'配信元不明')} · ${esc(ago(x.publishedAt))}</span></div>`).join('')||'<div class="aside-item">関連記事はありません。</div>';const external=safeExternalUrl(a.url);const linkText=external?(isGoogleNewsUrl(external)?'Google News経由で原文を開く ↗':isGenericArticleUrl(external)?'配信元サイトを開く ↗':'配信元の記事を開く ↗'):'';const sourceButton=external?`<a class="original-btn" href="${esc(external)}" target="_blank" rel="noopener noreferrer">${linkText}</a>`:'<span class="meta-pill">安全な原文URLを確認できません</span>';const mode=d.meta?.mode||a.origin||'fallback';const modeText=mode==='live'&&!d.meta?.degraded?'LIVE FEED':mode==='live'?'LIVE / DEGRADED':mode==='static-snapshot'?'STATIC SNAPSHOT':mode==='offline-cache'?'OFFLINE CACHE':mode==='stale-cache'?'CACHE':'FALLBACK';$('#articleShell').innerHTML=`<article class="article-main"><div class="crumb"><a href="index.html">最新ニュース</a> / ${esc(CATEGORY_LABELS[cat]||cat)}</div><div class="kicker">${esc(a.source||'配信元不明')}</div><h1>${esc(a.title)}</h1><p class="article-deck">${esc(a.summary||'配信フィードには十分な要約が含まれていません。以下の配信元リンクから詳細をご確認ください。')}</p><div class="article-meta"><span class="meta-pill">${esc(fmtDate(a.publishedAt,{time:true}))}</span>${companyLinks}${cats}${trend}<span class="meta-pill">${esc(modeText)}</span></div><section class="article-summary"><h2>AI BRIEF NOTE</h2><p>このページは取得した公開フィード情報を整理した記事ハブです。タイトル、配信元、時刻、カテゴリ、関連記事、急上昇情報をまとめています。</p></section>${sourceButton}<p class="legal-note">原文は外部サイトで開きます。Google NewsのURLは中継先で配信元へ移動します。AI BRIEF Ultraは原記事本文を保存・転載しません。</p></article><aside class="article-aside"><div class="aside-title">関連記事</div>${related}</aside>`;updateGlobalStatus(d.meta)}
++async function init(){if(!/^[a-zA-Z0-9_-]{4,80}$/.test(id)){$('#articleShell').innerHTML='<div class="errorbox"><strong>記事IDが不正です</strong><a href="index.html">トップへ戻る</a></div>';return}try{render(await api(`/api/article?id=${encodeURIComponent(id)}`))}catch(e){const offline=!navigator.onLine;$('#articleShell').innerHTML=`<div class="errorbox"><strong>記事を表示できません</strong>${offline?'オフライン保存にこの記事が含まれていない可能性があります。':'ニュース更新により古い記事IDが消えたか、取得に失敗した可能性があります。'}<br><a href="index.html">最新ニュースへ戻る</a></div>`}}
++init();
+diff --git a/public/common.js b/public/common.js
+index d9a2ee4..471f618 100644
+--- a/public/common.js
++++ b/public/common.js
+@@ -1,26 +1,38 @@
++'use strict';
++
+ const CATEGORY_LABELS={models:'モデル / 製品',infrastructure:'インフラ',safety:'安全性 / 政策',research:'研究',business:'企業 / 市場',general:'総合'};
+ const COMPANY_LABELS={openai:'OpenAI',google:'Google / DeepMind',anthropic:'Anthropic',nvidia:'NVIDIA',meta:'Meta',microsoft:'Microsoft',xai:'xAI',amazon:'Amazon / AWS'};
+ const KNOWN_COMPANIES=new Set(Object.keys(COMPANY_LABELS));
+ const $=(s,r=document)=>r.querySelector(s);const $$=(s,r=document)=>[...r.querySelectorAll(s)];
++
+ function esc(s=''){return String(s).replace(/[&<>'"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;',"'":'&#39;','"':'&quot;'}[c]))}
+ function validDate(iso){const d=new Date(iso);return Number.isFinite(d.getTime())?d:null}
+ function fmtDate(iso,{time=false}={}){const d=validDate(iso);if(!d)return'日時不明';try{return new Intl.DateTimeFormat('ja-JP',time?{month:'numeric',day:'numeric',hour:'2-digit',minute:'2-digit'}:{year:'numeric',month:'2-digit',day:'2-digit'}).format(d)}catch{return'日時不明'}}
+-function ago(iso){const date=validDate(iso);if(!date)return'日時不明';const d=(Date.now()-date.getTime())/1000;if(d<-900)return fmtDate(iso,{time:true});if(d<0)return'たった今';if(d<3600)return`${Math.max(1,Math.floor(d/60))}分前`;if(d<86400)return`${Math.floor(d/3600)}時間前`;if(d<604800)return`${Math.floor(d/86400)}日前`;return fmtDate(iso)}
+-function trim(s='',n=170){s=String(s??'').replace(/\s+/g,' ').trim();return s.length>n?s.slice(0,n-1)+'…':s}
++function ago(iso){const date=validDate(iso);if(!date)return'日時不明';const d=(Date.now()-date.getTime())/1000;if(d<0)return'たった今';if(d<3600)return`${Math.max(1,Math.floor(d/60))}分前`;if(d<86400)return`${Math.floor(d/3600)}時間前`;if(d<604800)return`${Math.floor(d/86400)}日前`;return fmtDate(iso)}
++function trim(s='',n=170){const chars=[...String(s??'').replace(/\s+/g,' ').trim()];return chars.length>n?chars.slice(0,n-1).join('')+'…':chars.join('')}
+ function primaryCategory(a){return Array.isArray(a?.categories)&&a.categories[0]||'general'}
+ function labelClass(cat){return cat==='infrastructure'||cat==='business'?'rust':cat==='research'?'olive':''}
+ function articleHref(id){return`article.html?id=${encodeURIComponent(String(id||''))}`}
+ function companyHref(c){return['openai','google','anthropic'].includes(c)?`${c}.html`:`company.html?company=${encodeURIComponent(c)}`}
+-function safeExternalUrl(value){try{const u=new URL(String(value||''),location.href);return u.protocol==='https:'||u.protocol==='http:'?u.href:''}catch{return''}}
++function safeExternalUrl(value){try{const u=new URL(String(value||''),location.href);return u.protocol==='https:'&&!u.username&&!u.password?u.href:''}catch{return''}}
++function isGoogleNewsUrl(value){try{return new URL(value).hostname==='news.google.com'}catch{return false}}
+ function isGenericArticleUrl(value){try{const u=new URL(value);return /^\/(news|blog)\/?$/i.test(u.pathname)||u.pathname==='/' }catch{return true}}
+-function cardHTML(a){const cat=primaryCategory(a);const companies=Array.isArray(a?.companies)?a.companies:[];const categories=Array.isArray(a?.categories)?a.categories:[];const flags=[...companies.slice(0,2).map(x=>COMPANY_LABELS[x]||x),...categories.slice(0,2).map(x=>CATEGORY_LABELS[x]||x)].slice(0,3);return`<article class="news-card"><div class="card-top"><span class="label ${labelClass(cat)}">${esc(CATEGORY_LABELS[cat]||cat)}</span><span class="date">${esc(ago(a?.publishedAt))}</span></div><h2>${esc(a?.title||'タイトル不明')}</h2><p>${esc(trim(a?.summary||'記事タイトルと配信元の情報をもとに掲載しています。詳細は記事ページから原文をご確認ください。'))}</p><div class="card-flags">${flags.map(x=>`<span class="tiny">${esc(x)}</span>`).join('')}</div><div class="card-foot"><span class="source">${esc(a?.source||'配信元不明')}</span><a class="detail-link" href="${articleHref(a?.id)}">詳細を見る →</a></div></article>`}
++function cardHTML(a){const cat=primaryCategory(a);const companies=Array.isArray(a?.companies)?a.companies:[];const categories=Array.isArray(a?.categories)?a.categories:[];const flags=[...companies.slice(0,2).map(x=>COMPANY_LABELS[x]||x),...categories.slice(0,2).map(x=>CATEGORY_LABELS[x]||x)].slice(0,3);return`<article class="news-card"><div class="card-top"><span class="label ${labelClass(cat)}">${esc(CATEGORY_LABELS[cat]||cat)}</span><span class="date">${esc(ago(a?.publishedAt))}</span></div><h2>${esc(a?.title||'タイトル不明')}</h2><p>${esc(trim(a?.summary||'配信フィードに要約がありません。詳細ページから原文をご確認ください。'))}</p><div class="card-flags">${flags.map(x=>`<span class="tiny">${esc(x)}</span>`).join('')}</div><div class="card-foot"><span class="source">${esc(a?.source||'配信元不明')}</span><a class="detail-link" href="${articleHref(a?.id)}">詳細を見る →</a></div></article>`}
+ function skeletons(n=6){return Array.from({length:n},()=>'<div class="sk-card"><div class="skeleton sk-line short"></div><div class="skeleton sk-line big"></div><div class="skeleton sk-line mid"></div><div class="skeleton sk-line"></div><div class="skeleton sk-line mid"></div></div>').join('')}
+-function modeLabel(mode){return mode==='live'?'LIVE':mode==='stale-cache'?'CACHE':'FALLBACK'}
+-function updateGlobalStatus(meta){const dot=$('#statusDot'),text=$('#statusText'),updated=$('#globalUpdated');if(!meta)return;const warn=meta.mode!=='live'||Boolean(meta.degraded);if(dot)dot.classList.toggle('warn',warn);if(text){if(meta.mode==='stale-cache')text.textContent='自動取得：キャッシュ表示';else if(meta.mode==='fallback')text.textContent='自動取得：フォールバック表示';else if(meta.degraded)text.textContent='自動取得：一部ソース取得失敗';else text.textContent='自動取得：正常'}if(updated)updated.textContent=`最終取得 ${fmtDate(meta.generatedAt,{time:true})}`}
++function modeLabel(mode){return mode==='live'?'LIVE':mode==='static-snapshot'?'SNAPSHOT':mode==='stale-cache'?'CACHE':mode==='offline-cache'?'OFFLINE':'FALLBACK'}
++function updateGlobalStatus(meta){const dot=$('#statusDot'),text=$('#statusText'),updated=$('#globalUpdated');if(!meta)return;const warn=meta.mode!=='live'||Boolean(meta.degraded);if(dot)dot.classList.toggle('warn',warn);if(text){if(meta.mode==='static-snapshot')text.textContent='自動取得：公開スナップショット';else if(meta.mode==='offline-cache')text.textContent='自動取得：オフライン保存';else if(meta.mode==='stale-cache')text.textContent='自動取得：キャッシュ表示';else if(meta.mode==='fallback')text.textContent='自動取得：フォールバック表示';else if(meta.degraded)text.textContent='自動取得：一部ソース取得失敗';else text.textContent='自動取得：正常'}if(updated)updated.textContent=`最終取得 ${fmtDate(meta.generatedAt,{time:true})}`}
+ function toast(msg){let t=$('#toast');if(!t){t=document.createElement('div');t.id='toast';t.className='toast';document.body.append(t)}t.setAttribute('role','status');t.setAttribute('aria-live','polite');t.textContent=msg;t.classList.add('show');clearTimeout(toast._timer);toast._timer=setTimeout(()=>t.classList.remove('show'),2400)}
+-async function api(path,opts={}){const controller=new AbortController();const timeout=Number(opts.timeoutMs)||15000;const timer=setTimeout(()=>controller.abort(),timeout);try{const {timeoutMs,...fetchOpts}=opts;const res=await fetch(path,{headers:{accept:'application/json',...(fetchOpts.headers||{})},...fetchOpts,signal:fetchOpts.signal||controller.signal});if(!res.ok){let detail='';try{detail=(await res.json())?.error||''}catch{}const e=new Error(`${res.status} ${detail||res.statusText}`);e.status=res.status;throw e}return await res.json()}finally{clearTimeout(timer)}}
++
++let snapshotPromise;
++function snapshotMeta(payload){const offline=Boolean(payload.__offline)||!navigator.onLine;return{generatedAt:payload.generatedAt,fetchedAt:payload.fetchedAt,mode:offline?'offline-cache':payload.delivery==='static-snapshot'?'static-snapshot':payload.mode||'stale-cache',degraded:Boolean(payload.degraded)||offline,sourceStats:payload.sourceStats||[],totalAvailable:payload.articles?.length||0,delivery:payload.delivery||'server-snapshot'}}
++async function loadSnapshot(){if(!snapshotPromise){const sources=isStaticDeployment()?['data/news.json']:['/api/snapshot','data/news.json'];snapshotPromise=(async()=>{let last;for(const source of sources){try{const r=await fetch(source,{headers:{accept:'application/json'},cache:'no-cache'});if(!r.ok)throw new Error(`snapshot ${r.status}`);const data=await r.json();if(r.headers.get('x-ainews-cache')==='offline')data.__offline=true;return data}catch(e){last=e}}throw last||new Error('snapshot unavailable')})().catch(e=>{snapshotPromise=null;throw e})}return snapshotPromise}
++function bounded(value,fallback,min,max){if(value===null||value==='')return fallback;if(!/^\d+$/.test(value||''))throw new Error('invalid parameter');const n=Number(value);if(n<min||n>max)throw new Error('invalid parameter');return n}
++function localRelated(payload,article,limit=8){const companies=new Set(article.companies||[]),cats=new Set((article.categories||[]).filter(x=>x!=='general'));return(payload.articles||[]).filter(x=>x.id!==article.id).map(x=>({x,score:(x.companies||[]).filter(c=>companies.has(c)).length*5+(x.categories||[]).filter(c=>cats.has(c)).length*2})).filter(x=>x.score>0).sort((a,b)=>b.score-a.score||new Date(b.x.publishedAt)-new Date(a.x.publishedAt)).slice(0,limit).map(x=>x.x)}
++async function staticApi(requestPath){const payload=await loadSnapshot();const u=new URL(requestPath,location.origin);const path=u.pathname;const meta=snapshotMeta(payload);if(path.endsWith('/api/news')){let rows=[...(payload.articles||[])];const company=(u.searchParams.get('company')||'').toLowerCase(),category=(u.searchParams.get('category')||'').toLowerCase(),q=(u.searchParams.get('q')||'').toLowerCase(),source=(u.searchParams.get('source')||'').toLowerCase();if(company)rows=rows.filter(a=>(a.companies||[]).includes(company));if(category)rows=rows.filter(a=>(a.categories||[]).includes(category));if(q)rows=rows.filter(a=>`${a.title||''} ${a.summary||''} ${a.source||''}`.toLowerCase().includes(q));if(source)rows=rows.filter(a=>String(a.source||'').toLowerCase().includes(source));const limit=bounded(u.searchParams.get('limit'),36,1,180),offset=bounded(u.searchParams.get('offset'),0,0,10000);return{meta,total:rows.length,items:rows.slice(offset,offset+limit)}}if(path.endsWith('/api/trending')){const limit=bounded(u.searchParams.get('limit'),15,1,50);return{meta,items:(payload.trending||[]).slice(0,limit)}}if(path.endsWith('/api/article')){const id=u.searchParams.get('id')||'',article=(payload.articles||[]).find(a=>a.id===id);if(!article){const e=new Error('article_not_found');e.status=404;throw e}return{article,cluster:(payload.trending||[]).find(t=>(t.relatedIds||[]).includes(id))||null,related:localRelated(payload,article),meta}}if(path.endsWith('/api/meta')){const sources=new Map(),companies=new Map(),categories=new Map();for(const a of payload.articles||[]){for(const s of a.sourceNames||[a.source])sources.set(s,(sources.get(s)||0)+1);for(const c of a.companies||[])companies.set(c,(companies.get(c)||0)+1);for(const c of a.categories||[])categories.set(c,(categories.get(c)||0)+1)}return{generatedAt:payload.generatedAt,mode:meta.mode,degraded:meta.degraded,totals:{articles:payload.articles.length,sources:sources.size},companies:Object.fromEntries(companies),categories:Object.fromEntries(categories),sources:[...sources].sort((a,b)=>b[1]-a[1]).slice(0,25).map(([name,count])=>({name,count}))}}throw new Error('static endpoint unavailable')}
++function isStaticDeployment(){return location.protocol==='file:'||location.hostname.endsWith('.github.io')}
++async function api(path,opts={}){if(isStaticDeployment()&&String(path).includes('/api/')){if(String(path).endsWith('/api/refresh')){const e=new Error('static refresh unavailable');e.status=501;throw e}return staticApi(path)}const controller=new AbortController();const timeout=Number(opts.timeoutMs)||15000;const timer=setTimeout(()=>controller.abort(),timeout);try{const{timeoutMs,...fetchOpts}=opts;const res=await fetch(path,{headers:{accept:'application/json',...(fetchOpts.headers||{})},...fetchOpts,signal:fetchOpts.signal||controller.signal});if(!res.ok){let detail='';try{detail=(await res.json())?.error||''}catch{}const e=new Error(`${res.status} ${detail||res.statusText}`);e.status=res.status;throw e}return await res.json()}catch(e){if(String(path).includes('/api/')&&(!e.status||e.status===404))return staticApi(path);throw e}finally{clearTimeout(timer)}}
+ function sleep(ms){return new Promise(r=>setTimeout(r,ms))}
+-function setupNav(){const btn=$('#menuBtn'),nav=$('#navLinks');if(btn&&!btn.getAttribute('aria-label'))btn.setAttribute('aria-label','メニュー');btn?.addEventListener('click',()=>{const open=nav?.classList.toggle('open');btn.setAttribute('aria-expanded',String(Boolean(open)))});$$('select').forEach(s=>{if(!s.getAttribute('aria-label'))s.setAttribute('aria-label','並び順')});const refresh=$('#refreshBtn');refresh?.addEventListener('click',async()=>{refresh.disabled=true;refresh.textContent='更新中…';try{const data=await api('/api/news?force=1&limit=1',{timeoutMs:30000});const status=data?.meta?.refreshStatus;if(status==='updated'){toast(data.meta.degraded?'更新しました（一部ソース失敗）':'最新ニュースへ更新しました');await sleep(700);location.reload()}else if(status==='throttled'){toast('更新間隔が短すぎます。少し後で再試行してください')}else{toast('ライブ更新に失敗したため保存データを表示しています')}}catch(e){toast('更新に失敗しました')}finally{refresh.disabled=false;refresh.textContent='↻ 更新'}})}
++function setupNav(){const btn=$('#menuBtn'),nav=$('#navLinks');const close=()=>{nav?.classList.remove('open');btn?.setAttribute('aria-expanded','false')};if(btn&&!btn.getAttribute('aria-label'))btn.setAttribute('aria-label','メニュー');btn?.addEventListener('click',e=>{e.stopPropagation();const open=nav?.classList.toggle('open');btn.setAttribute('aria-expanded',String(Boolean(open)))});document.addEventListener('keydown',e=>{if(e.key==='Escape'){close();btn?.focus()}});document.addEventListener('click',e=>{if(nav?.classList.contains('open')&&!nav.contains(e.target)&&e.target!==btn)close()});$$('select').forEach(s=>{if(!s.getAttribute('aria-label'))s.setAttribute('aria-label','並び順')});$$('.chip').forEach(b=>b.setAttribute('aria-pressed',String(b.classList.contains('active'))));const refresh=$('#refreshBtn');refresh?.addEventListener('click',async()=>{if(isStaticDeployment()){toast('公開版は毎時自動更新されます');return}refresh.disabled=true;refresh.textContent='更新中…';try{const data=await api('/api/refresh',{method:'POST',timeoutMs:30000});const status=data?.meta?.refreshStatus;if(status==='updated'){toast(data.meta.degraded?'更新しました（一部ソース失敗）':'最新ニュースへ更新しました');await sleep(700);location.reload()}else toast('ライブ更新に失敗したため保存データを表示しています')}catch(e){toast(e.status===429?'更新間隔が短すぎます。少し後で再試行してください':'更新に失敗しました')}finally{refresh.disabled=false;refresh.textContent='↻ 更新'}})}
+ function companyFromQuery(){const q=(new URLSearchParams(location.search).get('company')||'').trim().toLowerCase();if(q)return q;const f=(location.pathname.split('/').pop()||'').replace('.html','').toLowerCase();return['openai','google','anthropic'].includes(f)?f:''}
+-function registerServiceWorker(){if('serviceWorker'in navigator&&location.protocol!=='file:')navigator.serviceWorker.register('sw.js').catch(()=>{})}
++function registerServiceWorker(){if('serviceWorker'in navigator&&location.protocol!=='file:')navigator.serviceWorker.register('sw.js',{scope:'./'}).catch(()=>{})}
+ document.addEventListener('DOMContentLoaded',()=>{setupNav();registerServiceWorker()});
+diff --git a/public/company.html b/public/company.html
+index 87ce9be..fd0a315 100644
+--- a/public/company.html
++++ b/public/company.html
+@@ -1,5 +1,5 @@
+-<!doctype html><html lang="ja"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="theme-color" content="#f2efe8"><link rel="stylesheet" href="styles.css"><title>企業別ニュース — AI BRIEF Ultra</title></head><body>
++<!doctype html><html lang="ja"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="theme-color" content="#f2efe8"><link rel="manifest" href="manifest.webmanifest"><link rel="icon" href="icons/icon-192.png"><link rel="stylesheet" href="styles.css"><title>企業別ニュース — AI BRIEF Ultra</title></head><body><a class="skip-link" href="#main-content">本文へ移動</a><noscript><div class="noscript">このサイトのニュース表示にはJavaScriptが必要です。</div></noscript>
+ <div class="topline"><div class="wrap"><div class="status-inline"><span id="statusDot" class="status-dot"></span><span id="statusText">自動取得を確認中…</span></div><div id="globalUpdated" class="top-small">最新情報を読み込み中</div></div></div>
+-<header><div class="wrap nav"><a class="brand" href="index.html"><span class="brandmark">AI</span><span>AI BRIEF<span class="brand-sub">ULTRA EDITION</span></span></a><button id="menuBtn" class="menu-btn" aria-expanded="false">☰</button><nav id="navLinks" class="navlinks"><a href="index.html">最新</a><a href="trending.html">急上昇</a><a href="openai.html">OpenAI</a><a href="google.html">Google</a><a href="anthropic.html">Anthropic</a><a href="about.html">このサイトについて</a><button id="refreshBtn" class="refresh-btn">↻ 更新</button></nav></div></header>
+-<main><div class="wrap"><section class="page-hero"><div class="page-hero-inner"><div><div class="kicker">Company Watch</div><h1 id="companyTitle">Company</h1><p id="companyDesc">企業別の最新AIニュースを自動抽出します。</p></div><div id="companyBadge" class="page-badge">読込中</div></div></section><section class="section"><div class="toolbar"><label class="searchbox"><span class="sr-only">検索</span><input id="searchInput" type="search" placeholder="この企業のニュースを検索"></label><select id="sortSelect" class="select"><option value="latest">新着順</option><option value="source">配信元順</option></select><div id="resultCount" class="countbox">読込中</div></div><div id="newsGrid" class="news-grid"></div></section></div></main>
++<header><div class="wrap nav"><a class="brand" href="index.html"><span class="brandmark">AI</span><span>AI BRIEF<span class="brand-sub">ULTRA EDITION</span></span></a><button id="menuBtn" class="menu-btn" type="button" aria-expanded="false" aria-label="メニュー">☰</button><nav id="navLinks" class="navlinks"><a href="index.html">最新</a><a href="trending.html">急上昇</a><a href="openai.html">OpenAI</a><a href="google.html">Google</a><a href="anthropic.html">Anthropic</a><a href="about.html">このサイトについて</a><button id="refreshBtn" class="refresh-btn" type="button">↻ 更新</button></nav></div></header>
++<main id="main-content" tabindex="-1"><div class="wrap"><section class="page-hero"><div class="page-hero-inner"><div><div class="kicker">Company Watch</div><h1 id="companyTitle">Company</h1><p id="companyDesc">企業別の最新AIニュースを自動抽出します。</p></div><div id="companyBadge" class="page-badge">読込中</div></div></section><section class="section"><div class="toolbar"><label class="searchbox"><span class="sr-only">検索</span><input id="searchInput" type="search" placeholder="この企業のニュースを検索"></label><select id="sortSelect" class="select"><option value="latest">新着順</option><option value="source">配信元順</option></select><div id="resultCount" class="countbox" role="status" aria-live="polite" aria-atomic="true">読込中</div></div><div id="newsGrid" class="news-grid" aria-live="polite"></div></section></div></main>
+ <footer><div class="wrap footer-inner"><div class="footer-copy">AI BRIEF Ultra — 企業名や製品名を含むニュースを自動分類しています。分類は完全ではないため、重要判断では必ず原文をご確認ください。</div><div class="footer-links"><a href="index.html">最新</a><a href="trending.html">急上昇</a></div></div></footer><div id="toast" class="toast"></div><script src="common.js"></script><script src="company.js"></script></body></html>
+diff --git a/public/company.js b/public/company.js
+index b766102..36d8dc8 100644
+--- a/public/company.js
++++ b/public/company.js
+@@ -1,16 +1,11 @@
+-const COMPANY_INFO={
+- openai:{name:'OpenAI',desc:'ChatGPT、GPT、Codex、研究、安全性、企業導入、独自インフラなどOpenAI関連ニュース。'},
+- google:{name:'Google / DeepMind',desc:'Gemini、Google DeepMind、Gemma、ロボティクス、科学研究、安全性などGoogleのAI関連ニュース。'},
+- anthropic:{name:'Anthropic',desc:'Claude、エージェント、研究、安全性、企業導入などAnthropic関連ニュース。'},
+- nvidia:{name:'NVIDIA',desc:'GPU、CUDA、Blackwell、Rubin、AIデータセンターなどNVIDIA関連ニュース。'},
+- meta:{name:'Meta',desc:'Llama、Meta AI、研究、製品、安全性、インフラなどMeta関連ニュース。'},
+- microsoft:{name:'Microsoft',desc:'Copilot、Azure AI、OpenAI連携、企業導入、インフラなどMicrosoft関連ニュース。'},
+- xai:{name:'xAI',desc:'Grok、モデル、研究、製品、インフラなどxAI関連ニュース。'},
+- amazon:{name:'Amazon / AWS',desc:'AWS、Bedrock、クラウドAI、企業導入、インフラなどAmazon関連ニュース。'}
+-};
+-let rows=[];const key=companyFromQuery();const info=COMPANY_INFO[key]||null;
+-function showInvalidCompany(){document.title='企業が見つかりません — AI BRIEF Ultra';const title=$('#companyTitle'),desc=$('#companyDesc'),badge=$('#companyBadge'),grid=$('#newsGrid');if(title)title.textContent='企業が見つかりません';if(desc)desc.textContent='URLのcompany指定が不正、または未対応です。トップページから企業を選び直してください。';if(badge)badge.textContent='INVALID COMPANY';if(grid)grid.innerHTML='<div class="errorbox"><strong>企業指定が不正です</strong><a href="index.html">トップページへ戻る</a></div>'}
++'use strict';
++
++const COMPANY_INFO={openai:{name:'OpenAI',desc:'ChatGPT、GPT、Codex、研究、安全性、企業導入、独自インフラなどOpenAI関連ニュース。'},google:{name:'Google / DeepMind',desc:'Gemini、Google DeepMind、Gemma、ロボティクス、科学研究、安全性などGoogleのAI関連ニュース。'},anthropic:{name:'Anthropic',desc:'Claude、エージェント、研究、安全性、企業導入などAnthropic関連ニュース。'},nvidia:{name:'NVIDIA',desc:'GPU、CUDA、Blackwell、Rubin、AIデータセンターなどNVIDIA関連ニュース。'},meta:{name:'Meta',desc:'Llama、Meta AI、研究、製品、安全性、インフラなどMeta関連ニュース。'},microsoft:{name:'Microsoft',desc:'Copilot、Azure AI、OpenAI連携、企業導入、インフラなどMicrosoft関連ニュース。'},xai:{name:'xAI',desc:'Grok、モデル、研究、製品、インフラなどxAI関連ニュース。'},amazon:{name:'Amazon / AWS',desc:'AWS、Bedrock、クラウドAI、企業導入、インフラなどAmazon関連ニュース。'}};
++let rows=[],visibleCount=30,renderTimer;const key=companyFromQuery(),info=COMPANY_INFO[key]||null,stateKey=`ainews:company:${key}`;
++function showInvalidCompany(){document.title='企業が見つかりません — AI BRIEF Ultra';if($('#companyTitle'))$('#companyTitle').textContent='企業が見つかりません';if($('#companyDesc'))$('#companyDesc').textContent='URLのcompany指定が不正、または未対応です。トップページから企業を選び直してください。';if($('#companyBadge'))$('#companyBadge').textContent='INVALID COMPANY';if($('#newsGrid'))$('#newsGrid').innerHTML='<div class="errorbox"><strong>企業指定が不正です</strong><a href="index.html">トップページへ戻る</a></div>'}
+ if(info){document.title=`${info.name} 最新AIニュース — AI BRIEF Ultra`;$('#companyTitle').textContent=info.name;$('#companyDesc').textContent=info.desc;$$('#navLinks a').forEach(a=>{if(a.getAttribute('href')===`${key}.html`)a.classList.add('active')})}else showInvalidCompany();
+-function render(){if(!info)return;const q=($('#searchInput')?.value||'').trim().toLowerCase();let show=rows.filter(a=>!q||`${a.title||''} ${a.summary||''} ${a.source||''}`.toLowerCase().includes(q));if($('#sortSelect')?.value==='source')show.sort((a,b)=>String(a.source||'').localeCompare(String(b.source||''),'ja')||new Date(b.publishedAt||0)-new Date(a.publishedAt||0));else show.sort((a,b)=>new Date(b.publishedAt||0)-new Date(a.publishedAt||0));$('#resultCount').textContent=`${show.length}件`;$('#newsGrid').innerHTML=show.length?show.map(cardHTML).join(''):'<div class="empty">現在、この企業に一致するニュースがありません。</div>'}
+-async function init(){if(!info)return;const grid=$('#newsGrid');grid.innerHTML=skeletons(6);try{const data=await api(`/api/news?company=${encodeURIComponent(key)}&limit=180`);rows=Array.isArray(data.items)?data.items:[];updateGlobalStatus(data.meta);$('#companyBadge').textContent=`${modeLabel(data.meta?.mode)} · ${data.total??rows.length} ARTICLES`;render()}catch(e){grid.innerHTML='<div class="errorbox"><strong>取得に失敗しました</strong>サーバーまたはオフラインキャッシュを確認してください。</div>'}}
+-$('#searchInput')?.addEventListener('input',render);$('#sortSelect')?.addEventListener('change',render);init();
++function saveState(){sessionStorage.setItem(stateKey,JSON.stringify({q:$('#searchInput')?.value||'',sort:$('#sortSelect')?.value||'latest',visibleCount,scrollY}))}
++function restoreState(){let state={};try{state=JSON.parse(sessionStorage.getItem(stateKey)||'{}')}catch{}if($('#searchInput'))$('#searchInput').value=state.q||'';if($('#sortSelect'))$('#sortSelect').value=state.sort==='source'?'source':'latest';visibleCount=Math.max(30,Math.min(180,Number(state.visibleCount)||30));return Math.max(0,Number(state.scrollY)||0)}
++function render(){if(!info)return;const q=($('#searchInput')?.value||'').trim().toLowerCase();const show=rows.filter(a=>!q||`${a.title||''} ${a.summary||''} ${a.source||''}`.toLowerCase().includes(q));if($('#sortSelect')?.value==='source')show.sort((a,b)=>String(a.source||'').localeCompare(String(b.source||''),'ja')||new Date(b.publishedAt||0)-new Date(a.publishedAt||0));else show.sort((a,b)=>new Date(b.publishedAt||0)-new Date(a.publishedAt||0));const shown=show.slice(0,visibleCount);$('#resultCount').textContent=`${show.length}件中 ${shown.length}件`;$('#newsGrid').innerHTML=shown.length?shown.map(cardHTML).join(''):'<div class="empty">現在、この企業に一致するニュースがありません。</div>';$('#loadMoreBtn')?.remove();if(shown.length<show.length){$('#newsGrid').insertAdjacentHTML('afterend',`<button id="loadMoreBtn" class="load-more" type="button">さらに表示（残り${show.length-shown.length}件）</button>`);$('#loadMoreBtn').addEventListener('click',()=>{visibleCount=Math.min(show.length,visibleCount+30);render()})}saveState()}
++async function init(){if(!info)return;const restoreY=restoreState(),grid=$('#newsGrid');grid.innerHTML=skeletons(6);try{const data=await api(`/api/news?company=${encodeURIComponent(key)}&limit=180`);rows=Array.isArray(data.items)?data.items:[];updateGlobalStatus(data.meta);$('#companyBadge').textContent=`${modeLabel(data.meta?.mode)} · ${data.total??rows.length} ARTICLES`;render();requestAnimationFrame(()=>scrollTo({top:restoreY,behavior:'instant'}))}catch(e){grid.innerHTML='<div class="errorbox"><strong>取得に失敗しました</strong>サーバーまたはオフライン保存を確認してください。</div>'}}
++$('#searchInput')?.addEventListener('input',()=>{clearTimeout(renderTimer);renderTimer=setTimeout(()=>{visibleCount=30;render()},160)});$('#sortSelect')?.addEventListener('change',()=>{visibleCount=30;render()});addEventListener('pagehide',saveState);init();
+diff --git a/public/google.html b/public/google.html
+index 81b705e..6207c8e 100644
+--- a/public/google.html
++++ b/public/google.html
+@@ -1,5 +1,5 @@
+-<!doctype html><html lang="ja"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="theme-color" content="#f2efe8"><link rel="stylesheet" href="styles.css"><title>Google / DeepMind 最新ニュース — AI BRIEF Ultra</title></head><body>
++<!doctype html><html lang="ja"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="theme-color" content="#f2efe8"><link rel="manifest" href="manifest.webmanifest"><link rel="icon" href="icons/icon-192.png"><link rel="stylesheet" href="styles.css"><title>Google / DeepMind 最新ニュース — AI BRIEF Ultra</title></head><body><a class="skip-link" href="#main-content">本文へ移動</a><noscript><div class="noscript">このサイトのニュース表示にはJavaScriptが必要です。</div></noscript>
+ <div class="topline"><div class="wrap"><div class="status-inline"><span id="statusDot" class="status-dot"></span><span id="statusText">自動取得を確認中…</span></div><div id="globalUpdated" class="top-small">最新情報を読み込み中</div></div></div>
+-<header><div class="wrap nav"><a class="brand" href="index.html"><span class="brandmark">AI</span><span>AI BRIEF<span class="brand-sub">ULTRA EDITION</span></span></a><button id="menuBtn" class="menu-btn" aria-expanded="false">☰</button><nav id="navLinks" class="navlinks"><a href="index.html">最新</a><a href="trending.html">急上昇</a><a href="openai.html">OpenAI</a><a href="google.html">Google</a><a href="anthropic.html">Anthropic</a><a href="about.html">このサイトについて</a><button id="refreshBtn" class="refresh-btn">↻ 更新</button></nav></div></header>
+-<main><div class="wrap"><section class="page-hero"><div class="page-hero-inner"><div><div class="kicker">Company Watch</div><h1 id="companyTitle">Company</h1><p id="companyDesc">企業別の最新AIニュースを自動抽出します。</p></div><div id="companyBadge" class="page-badge">読込中</div></div></section><section class="section"><div class="toolbar"><label class="searchbox"><span class="sr-only">検索</span><input id="searchInput" type="search" placeholder="この企業のニュースを検索"></label><select id="sortSelect" class="select"><option value="latest">新着順</option><option value="source">配信元順</option></select><div id="resultCount" class="countbox">読込中</div></div><div id="newsGrid" class="news-grid"></div></section></div></main>
++<header><div class="wrap nav"><a class="brand" href="index.html"><span class="brandmark">AI</span><span>AI BRIEF<span class="brand-sub">ULTRA EDITION</span></span></a><button id="menuBtn" class="menu-btn" type="button" aria-expanded="false" aria-label="メニュー">☰</button><nav id="navLinks" class="navlinks"><a href="index.html">最新</a><a href="trending.html">急上昇</a><a href="openai.html">OpenAI</a><a href="google.html">Google</a><a href="anthropic.html">Anthropic</a><a href="about.html">このサイトについて</a><button id="refreshBtn" class="refresh-btn" type="button">↻ 更新</button></nav></div></header>
++<main id="main-content" tabindex="-1"><div class="wrap"><section class="page-hero"><div class="page-hero-inner"><div><div class="kicker">Company Watch</div><h1 id="companyTitle">Company</h1><p id="companyDesc">企業別の最新AIニュースを自動抽出します。</p></div><div id="companyBadge" class="page-badge">読込中</div></div></section><section class="section"><div class="toolbar"><label class="searchbox"><span class="sr-only">検索</span><input id="searchInput" type="search" placeholder="この企業のニュースを検索"></label><select id="sortSelect" class="select"><option value="latest">新着順</option><option value="source">配信元順</option></select><div id="resultCount" class="countbox" role="status" aria-live="polite" aria-atomic="true">読込中</div></div><div id="newsGrid" class="news-grid" aria-live="polite"></div></section></div></main>
+ <footer><div class="wrap footer-inner"><div class="footer-copy">AI BRIEF Ultra — 企業名や製品名を含むニュースを自動分類しています。分類は完全ではないため、重要判断では必ず原文をご確認ください。</div><div class="footer-links"><a href="index.html">最新</a><a href="trending.html">急上昇</a></div></div></footer><div id="toast" class="toast"></div><script src="common.js"></script><script src="company.js"></script></body></html>
+diff --git a/public/home.js b/public/home.js
+index 2a6f8d3..467ef07 100644
+--- a/public/home.js
++++ b/public/home.js
+@@ -1,6 +1,13 @@
+-let allArticles=[],activeCat='';
++'use strict';
++
++let allArticles=[],activeCat='',visibleCount=30,renderTimer;
++const stateKey=`ainews:home:${location.pathname}`;
+ function renderLead(a){const el=$('#leadStory');if(!el)return;if(!a){el.innerHTML='<div class="lead-no">TOP STORY</div><div>表示できる記事がありません。</div>';return}el.innerHTML=`<div class="lead-no">TOP STORY<br>${esc(ago(a.publishedAt))}</div><div><h2 class="lead-title">${esc(a.title)}</h2><p class="lead-summary">${esc(trim(a.summary||'最新のAIニュースです。詳細ページから配信元と原文を確認できます。',240))}</p><a class="inline-link" href="${articleHref(a.id)}">記事詳細を読む →</a></div>`}
+-function renderMini(items){const el=$('#trendMini');if(!el)return;el.innerHTML=(Array.isArray(items)?items:[]).slice(0,4).map((x,i)=>`<div class="trend-mini-item"><div class="trend-rank">${String(i+1).padStart(2,'0')}</div><a class="trend-mini-title" href="${articleHref(x.id)}" style="text-decoration:none">${esc(trim(x.title,75))}</a><div class="trend-score">${Number.isFinite(Number(x.score))?Math.round(Number(x.score)):'—'}</div></div>`).join('')||'<div class="side-foot">急上昇データなし</div>'}
+-function renderGrid(){const search=$('#searchInput'),sort=$('#sortSelect'),count=$('#resultCount'),grid=$('#newsGrid');if(!grid)return;const q=(search?.value||'').trim().toLowerCase();let rows=allArticles.filter(a=>(!activeCat||(Array.isArray(a.categories)&&a.categories.includes(activeCat)))&&(!q||`${a.title||''} ${a.summary||''} ${a.source||''}`.toLowerCase().includes(q)));if(sort?.value==='source')rows.sort((a,b)=>String(a.source||'').localeCompare(String(b.source||''),'ja')||new Date(b.publishedAt||0)-new Date(a.publishedAt||0));else rows.sort((a,b)=>new Date(b.publishedAt||0)-new Date(a.publishedAt||0));if(count)count.textContent=`${rows.length}件`;grid.innerHTML=rows.length?rows.map(cardHTML).join(''):'<div class="empty">条件に一致するニュースがありません。</div>'}
+-async function init(){const grid=$('#newsGrid');if(!grid)return;grid.innerHTML=skeletons(6);const results=await Promise.allSettled([api('/api/news?limit=180'),api('/api/trending?limit=8'),api('/api/meta')]);const newsResult=results[0];if(newsResult.status!=='fulfilled'){console.error(newsResult.reason);grid.innerHTML='<div class="errorbox"><strong>ニュースを取得できませんでした</strong>サーバーまたはオフラインキャッシュを確認してください。</div>';const lead=$('#leadStory');if(lead)lead.innerHTML='<div class="lead-no">ERROR</div><div>ニュースAPIへ接続できませんでした。</div>';return}const news=newsResult.value;allArticles=Array.isArray(news.items)?news.items:[];updateGlobalStatus(news.meta);renderLead(allArticles[0]);const trend=results[1].status==='fulfilled'?results[1].value:null;renderMini(trend?.items||[]);const feed=$('#feedMode');if(feed)feed.textContent=modeLabel(news.meta?.mode);const meta=results[2].status==='fulfilled'?results[2].value:null;const articleTotal=$('#articleTotal'),sourceTotal=$('#sourceTotal');if(articleTotal)articleTotal.textContent=meta?.totals?.articles??news.meta?.totalAvailable??allArticles.length;if(sourceTotal)sourceTotal.textContent=meta?.totals?.sources??'—';renderGrid()}
+-$('#searchInput')?.addEventListener('input',renderGrid);$('#sortSelect')?.addEventListener('change',renderGrid);$$('#filters .chip').forEach(b=>b.addEventListener('click',()=>{$$('#filters .chip').forEach(x=>x.classList.remove('active'));b.classList.add('active');activeCat=b.dataset.cat||'';renderGrid()}));init();
++function renderMini(items){const el=$('#trendMini');if(!el)return;el.innerHTML=(Array.isArray(items)?items:[]).slice(0,4).map((x,i)=>`<div class="trend-mini-item"><div class="trend-rank">${String(i+1).padStart(2,'0')}</div><a class="trend-mini-title" href="${articleHref(x.id)}">${esc(trim(x.title,75))}</a><div class="trend-score">${Number.isFinite(Number(x.score))?Math.round(Number(x.score)):'—'}</div></div>`).join('')||'<div class="side-foot">急上昇データなし</div>'}
++function saveState(){const search=$('#searchInput'),sort=$('#sortSelect');const state={q:search?.value||'',sort:sort?.value||'latest',cat:activeCat,visibleCount,scrollY};sessionStorage.setItem(stateKey,JSON.stringify(state));const u=new URL(location.href);state.q?u.searchParams.set('q',state.q):u.searchParams.delete('q');state.cat?u.searchParams.set('category',state.cat):u.searchParams.delete('category');state.sort!=='latest'?u.searchParams.set('sort',state.sort):u.searchParams.delete('sort');history.replaceState(null,'',u)}
++function restoreState(){let state={};try{state=JSON.parse(sessionStorage.getItem(stateKey)||'{}')}catch{}const params=new URLSearchParams(location.search);const q=params.get('q')??state.q??'',cat=params.get('category')??state.cat??'',sort=params.get('sort')??state.sort??'latest';if($('#searchInput'))$('#searchInput').value=q;if($('#sortSelect'))$('#sortSelect').value=['latest','source'].includes(sort)?sort:'latest';activeCat=cat;visibleCount=Math.max(30,Math.min(180,Number(state.visibleCount)||30));$$('#filters .chip').forEach(b=>{const active=(b.dataset.cat||'')===activeCat;b.classList.toggle('active',active);b.setAttribute('aria-pressed',String(active))});return Math.max(0,Number(state.scrollY)||0)}
++function filteredRows(){const q=($('#searchInput')?.value||'').trim().toLowerCase();const rows=allArticles.filter(a=>(!activeCat||(Array.isArray(a.categories)&&a.categories.includes(activeCat)))&&(!q||`${a.title||''} ${a.summary||''} ${a.source||''}`.toLowerCase().includes(q)));if($('#sortSelect')?.value==='source')rows.sort((a,b)=>String(a.source||'').localeCompare(String(b.source||''),'ja')||new Date(b.publishedAt||0)-new Date(a.publishedAt||0));else rows.sort((a,b)=>new Date(b.publishedAt||0)-new Date(a.publishedAt||0));return rows}
++function renderGrid(){const count=$('#resultCount'),grid=$('#newsGrid');if(!grid)return;const rows=filteredRows(),shown=rows.slice(0,visibleCount);if(count)count.textContent=`${rows.length}件中 ${shown.length}件`;grid.innerHTML=shown.length?shown.map(cardHTML).join(''):'<div class="empty">条件に一致するニュースがありません。</div>';$('#loadMoreBtn')?.remove();if(shown.length<rows.length){grid.insertAdjacentHTML('afterend',`<button id="loadMoreBtn" class="load-more" type="button">さらに表示（残り${rows.length-shown.length}件）</button>`);$('#loadMoreBtn')?.addEventListener('click',()=>{visibleCount=Math.min(rows.length,visibleCount+30);renderGrid()})}saveState()}
++function scheduleRender(){clearTimeout(renderTimer);renderTimer=setTimeout(()=>{visibleCount=30;renderGrid()},160)}
++async function init(){const grid=$('#newsGrid');if(!grid)return;const restoreY=restoreState();grid.innerHTML=skeletons(6);const results=await Promise.allSettled([api('/api/news?limit=180'),api('/api/trending?limit=8'),api('/api/meta')]);const newsResult=results[0];if(newsResult.status!=='fulfilled'){console.error(newsResult.reason);grid.innerHTML='<div class="errorbox"><strong>ニュースを取得できませんでした</strong>サーバーまたはオフライン保存を確認してください。</div>';const lead=$('#leadStory');if(lead)lead.innerHTML='<div class="lead-no">ERROR</div><div>ニュースデータへ接続できませんでした。</div>';return}const news=newsResult.value;allArticles=Array.isArray(news.items)?news.items:[];updateGlobalStatus(news.meta);renderLead(allArticles[0]);const trend=results[1].status==='fulfilled'?results[1].value:null;renderMini(trend?.items||[]);if($('#feedMode'))$('#feedMode').textContent=modeLabel(news.meta?.mode);const meta=results[2].status==='fulfilled'?results[2].value:null;if($('#articleTotal'))$('#articleTotal').textContent=meta?.totals?.articles??news.meta?.totalAvailable??allArticles.length;if($('#sourceTotal'))$('#sourceTotal').textContent=meta?.totals?.sources??'—';renderGrid();requestAnimationFrame(()=>scrollTo({top:restoreY,behavior:'instant'}))}
++$('#searchInput')?.addEventListener('input',scheduleRender);$('#sortSelect')?.addEventListener('change',()=>{visibleCount=30;renderGrid()});$$('#filters .chip').forEach(b=>b.addEventListener('click',()=>{$$('#filters .chip').forEach(x=>{x.classList.remove('active');x.setAttribute('aria-pressed','false')});b.classList.add('active');b.setAttribute('aria-pressed','true');activeCat=b.dataset.cat||'';visibleCount=30;renderGrid()}));addEventListener('pagehide',saveState);init();
+diff --git a/public/icons/icon-192.png b/public/icons/icon-192.png
+new file mode 100644
+index 0000000000000000000000000000000000000000..2809b854fc51d7ac59687567b6244771979a672b
+GIT binary patch
+literal 711
+zcmeAS@N?(olHy`uVBq!ia0vp^2SAvE4M+yv$zf+;VCwU9aSW-r_4f8bURMW^wu>)a
+z7|lu+dj7rXY2v^xW_-}}yUsqgf9CFSN2Vm-_tVTi%E9D7Dol)?zEg{V1!x-s10zEN
+z1A_wtg8~DC00RRD1G+Gy0#3MKTU+5OE`lcDFc>Dh%dUoj;laz_7Z)-)Je;==$o~J`
+zyPb!j_5Xif28MeFY)W1*1iUggz~VNT5ip-Ps9$GdWKeio3iOXhB`?rFL2>_?85*Ws
+z|Hr_vz~z4-Bf|o2hDbJ62GW2j&;k;{gW`<&&de}PARC*R7#bWI84fI9U`PmHU@*{N
+yV2}`DVBi6!2B<VlH7#h*?Z0>#I7x&r*KyyfeD3fkf8KMDn>=0pT-G@yGywowAY$AA
+
+literal 0
+HcmV?d00001
+
+diff --git a/public/icons/icon-512.png b/public/icons/icon-512.png
+new file mode 100644
+index 0000000000000000000000000000000000000000..6fd6f45a1967a680bd1260ba6cd98ad15f586414
+GIT binary patch
+literal 3372
+zcmcImUrbwd6h8OncHE6k+GPp261b#B9#jUI35^bSDF`FcW-%^V)G3O|_98GN9cDsq
+z7-Ta68?zT5Fv^38FB<R#SQ9L4f$-om6Jr_&StpB$jx80<Y#3&K=Xd|~4=sPxJwWgM
+zopZkPo$s9UYd<_1Y~HhL|1Kih({iNoB_bJ*GO0W8@n`oBt3<p1Xlbl}x%;O(Kh}HB
+z>HA#MU46!DQP<;3VehdLDk|Ok<*yCi<b2!7()%Hqp1SNIT|khV$iS0Aq~Sv%QfU*@
+zHr<)4m1HaEY3?abDTvhBraT!*F&enM_-9kMSB~_0CA{cdDF~@tvy6%}j||uVEeRi4
+zXH^v8p^{{9B^;vhStm~L01%xc6pqY?no5)f0|Q4ZV3C<urDjg1Gh4+V;g!vm$$<@L
+z*YPAXJph3VN7<%aXF9BT+*2kEP8*^ht?l`xdF476&uFZV&WS}OnMaBN6NqMLh@kA^
+zxnV-rtm1Q{I*GDjP_rzkD4BV6^2@9=vxTls@5F&Y|Czp-H*Fe_C6^oyaUsa-3IF5(
+z>vMB%{zcYJJsfQJAx=-8e%Hs6&4e$$x)Xfey~7JHKw=}YbPIbdQGa=5?LH``t@$Uv
+zupwL)#1j@on+4%5v>=XK5VJN!=&Xqy`wkZalD3UE5tUWehT0U0<Fz*Pm8&`wY=07P
+z#@zgn3k*@h*n@8|34Gwe6yl&p1_7WTSdK2;npFw^fyS6C!kqBGKfF*PQTMQ7czs0S
+zi_|I1d#Qa;<XASNX0u*p?j$plv~^UrM&Zoi-FJ<-7MiG$wdD6*MTdfN6vU^)Uq#}l
+zMS8XO?ZpC<k)BxkEohPKJ9p-Q?K~3kmQ_meS=ER~7mF<4&e+`x7O?-+UsskMBb4Ya
+z{U-9Wh5JaX=Xd{3f-cJW+gBaft_}zG(z7<KzF2O<e$rcDJJhe%jk?Ud?!T*I{j8ed
+z={un^Xh}tEz#FNNqv~|kLJT!EsiB)JV0B=$u=d^^kLhv$o=Su6<(Z+Lvx-slDWV}o
+z^!!zItT4iGIC`rXfhzf)4lK`9p@`Q0rVA$k?xVqLwwq^vMd;09f$qCfCE6&A%uYlG
+zSYqa4+BoAPL$wySb8~$Pve~TDIhnMl>I5gQ<iQ)1y!NP-EirO%%cPJIBAn`v4Tuue
+zA$P>h^Hm*i7`vAR&Cd@8bf&BG#3D#0#pnp5UIjaLqYN}vjPz6;g5B7m51<^D4#N&n
+zWhy_$HUz6U#HDWVXkx`QG1xj}=gH!d#c^vt&!2`SBrpx=pDc1Vsa6*?o*TppB_$9V
+zpWA?v%=ev6NpzLhU5Z}^YdqjDQH3+!F_Lv&YuKv;QOu<q8jItoDq+ep847`f8n9X%
+z1hXs&#9X8|^G2D(vp6x<5him6$D2jxFge`d@@F8s=*e^MZ8lFiT8A0NjE`VAO}V(Q
+z+noQ8%;|$d&Psp^Z;3T->sBDeIdhIuWO8hZ*~b)9HB`YZ%{}_g!j2bM9{K5E8%m^j
+z!%2IhQ%jq<joVUh^_|f|b7>WOJy0FK0nBD%3B+yT>~1<eaphRO<$X@SJ^mNz{za1=
+zPFa^6e@&%sk2DqeUf8goIc`3yp%`Q5>a}NaVr-pc_I3A=HpC$QC5CGN>rc36u+X^2
+z#IHh)N~L@@173N;EK>&5=I$B*O#%<^w<oR5xDHIdGP>5V<71?wmgj?wUk6(I{sG`4
+BHr)UK
+
+literal 0
+HcmV?d00001
+
+diff --git a/public/index.html b/public/index.html
+index f561a1a..32568e6 100644
+--- a/public/index.html
++++ b/public/index.html
+@@ -1,9 +1,9 @@
+-<!doctype html><html lang="ja"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="description" content="AI BRIEF Ultra - 最新AIニュースを自動収集し、急上昇・企業別・記事詳細まで整理するニュースサイト"><meta name="theme-color" content="#f2efe8"><link rel="manifest" href="manifest.webmanifest"><link rel="stylesheet" href="styles.css"><title>AI BRIEF Ultra — 最新AIニュース</title></head><body>
++<!doctype html><html lang="ja"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="description" content="AI BRIEF Ultra - 最新AIニュースを自動収集し、急上昇・企業別・記事詳細まで整理するニュースサイト"><meta name="theme-color" content="#f2efe8"><link rel="manifest" href="manifest.webmanifest"><link rel="icon" href="icons/icon-192.png"><link rel="stylesheet" href="styles.css"><title>AI BRIEF Ultra — 最新AIニュース</title></head><body><a class="skip-link" href="#main-content">本文へ移動</a><noscript><div class="noscript">このサイトのニュース表示にはJavaScriptが必要です。</div></noscript>
+ <div class="topline"><div class="wrap"><div class="status-inline"><span id="statusDot" class="status-dot"></span><span id="statusText">自動取得を確認中…</span></div><div id="globalUpdated" class="top-small">最新情報を読み込み中</div></div></div>
+-<header><div class="wrap nav"><a class="brand" href="index.html"><span class="brandmark">AI</span><span>AI BRIEF<span class="brand-sub">ULTRA EDITION</span></span></a><button id="menuBtn" class="menu-btn" aria-expanded="false" aria-label="メニュー">☰</button><nav id="navLinks" class="navlinks"><a class="active" href="index.html">最新</a><a href="trending.html">急上昇</a><a href="openai.html">OpenAI</a><a href="google.html">Google</a><a href="anthropic.html">Anthropic</a><a href="about.html">このサイトについて</a><button id="refreshBtn" class="refresh-btn">↻ 更新</button></nav></div></header>
+-<main><div class="wrap">
+-<section class="hero"><div class="panel hero-main"><div class="kicker">Live AI Intelligence Feed</div><h1>AIの「今」を、<br>一枚で読む。</h1><p class="hero-copy">アクセスするたびに最新AIニュースを取得し、複数ソースを重複除去。企業・モデル・研究・安全性・インフラまで横断し、重要な動きを短時間で把握できるよう整理します。</p><div class="hero-meta"><span class="meta-pill">自動更新</span><span class="meta-pill">重複除去</span><span class="meta-pill">急上昇スコア</span><span class="meta-pill">企業別ページ</span><span class="meta-pill">記事詳細</span></div><div id="leadStory" class="lead-story"><div class="lead-no">TOP STORY<br>LOADING</div><div><div class="skeleton sk-line big"></div><div class="skeleton sk-line mid"></div><div class="skeleton sk-line"></div></div></div></div><aside class="panel hero-side"><div class="side-title"><span>Today at a glance</span><span id="feedMode">—</span></div><div class="snapshot"><div class="stat"><strong id="articleTotal">—</strong><span>取得記事</span></div><div class="stat"><strong id="sourceTotal">—</strong><span>配信元</span></div></div><div class="side-title"><span>Trending now</span><a href="trending.html" style="text-decoration:none">一覧 →</a></div><div id="trendMini" class="trend-mini"></div><div class="side-foot">急上昇は鮮度・複数媒体での報道・検索トピックの広がりを組み合わせて算出します。</div></aside></section>
++<header><div class="wrap nav"><a class="brand" href="index.html"><span class="brandmark">AI</span><span>AI BRIEF<span class="brand-sub">ULTRA EDITION</span></span></a><button id="menuBtn" class="menu-btn" type="button" aria-expanded="false" aria-label="メニュー">☰</button><nav id="navLinks" class="navlinks"><a class="active" href="index.html">最新</a><a href="trending.html">急上昇</a><a href="openai.html">OpenAI</a><a href="google.html">Google</a><a href="anthropic.html">Anthropic</a><a href="about.html">このサイトについて</a><button id="refreshBtn" class="refresh-btn" type="button">↻ 更新</button></nav></div></header>
++<main id="main-content" tabindex="-1"><div class="wrap">
++<section class="hero"><div class="panel hero-main"><div class="kicker">Live AI Intelligence Feed</div><h1>AIの「今」を、<br>一枚で読む。</h1><p class="hero-copy">アクセスするたびに最新AIニュースを取得し、複数ソースを重複除去。企業・モデル・研究・安全性・インフラまで横断し、重要な動きを短時間で把握できるよう整理します。</p><div class="hero-meta"><span class="meta-pill">自動更新</span><span class="meta-pill">重複除去</span><span class="meta-pill">急上昇スコア</span><span class="meta-pill">企業別ページ</span><span class="meta-pill">記事詳細</span></div><div id="leadStory" class="lead-story"><div class="lead-no">TOP STORY<br>LOADING</div><div><div class="skeleton sk-line big"></div><div class="skeleton sk-line mid"></div><div class="skeleton sk-line"></div></div></div></div><aside class="panel hero-side"><div class="side-title"><span>Today at a glance</span><span id="feedMode">—</span></div><div class="snapshot"><div class="stat"><strong id="articleTotal">—</strong><span>取得記事</span></div><div class="stat"><strong id="sourceTotal">—</strong><span>配信元</span></div></div><div class="side-title"><span>Trending now</span><a href="trending.html" class="unstyled-link">一覧 →</a></div><div id="trendMini" class="trend-mini"></div><div class="side-foot">急上昇は鮮度・複数媒体での報道・検索トピックの広がりを組み合わせて算出します。</div></aside></section>
+ <section class="section"><div class="section-head"><div><div class="kicker">Company watch</div><h2 class="section-title">主要AI企業を追う</h2></div><p class="section-note">OpenAI / Google DeepMind / Anthropicを独立ページで追跡。関連ニュースだけを自動抽出します。</p></div><div class="company-strip"><a class="company-card" href="openai.html"><div class="company-code">COMPANY 01</div><div class="company-name">OpenAI</div><p class="company-desc">ChatGPT、GPT、Codex、研究、安全性、インフラ。</p><div class="company-arrow">最新ニュースを見る →</div></a><a class="company-card" href="google.html"><div class="company-code">COMPANY 02</div><div class="company-name">Google / DeepMind</div><p class="company-desc">Gemini、研究、ロボティクス、科学、安全性。</p><div class="company-arrow">最新ニュースを見る →</div></a><a class="company-card" href="anthropic.html"><div class="company-code">COMPANY 03</div><div class="company-name">Anthropic</div><p class="company-desc">Claude、エージェント、企業導入、安全性、研究。</p><div class="company-arrow">最新ニュースを見る →</div></a></div></section>
+-<section class="section"><div class="section-head"><div><div class="kicker">Latest</div><h2 class="section-title">最新ニュース</h2></div><p class="section-note">ニュースはサーバー側で取得・整理されます。原文は記事詳細ページから開けます。</p></div><div class="toolbar"><label class="searchbox"><span class="sr-only">検索</span><input id="searchInput" type="search" placeholder="OpenAI、Gemini、AI chip、安全性…"></label><select id="sortSelect" class="select" aria-label="並び順"><option value="latest">新着順</option><option value="source">配信元順</option></select><div id="resultCount" class="countbox">読込中</div></div><div id="filters" class="filters"><button class="chip active" data-cat="">すべて</button><button class="chip" data-cat="models">モデル / 製品</button><button class="chip" data-cat="infrastructure">インフラ</button><button class="chip" data-cat="safety">安全性 / 政策</button><button class="chip" data-cat="research">研究</button><button class="chip" data-cat="business">企業 / 市場</button></div><div id="newsGrid" class="news-grid"></div></section>
++<section class="section"><div class="section-head"><div><div class="kicker">Latest</div><h2 class="section-title">最新ニュース</h2></div><p class="section-note">ニュースはサーバー側で取得・整理されます。原文は記事詳細ページから開けます。</p></div><div class="toolbar"><label class="searchbox"><span class="sr-only">検索</span><input id="searchInput" type="search" placeholder="OpenAI、Gemini、AI chip、安全性…"></label><select id="sortSelect" class="select" aria-label="並び順"><option value="latest">新着順</option><option value="source">配信元順</option></select><div id="resultCount" class="countbox" role="status" aria-live="polite" aria-atomic="true">読込中</div></div><div id="filters" class="filters"><button class="chip active" data-cat="">すべて</button><button class="chip" data-cat="models">モデル / 製品</button><button class="chip" data-cat="infrastructure">インフラ</button><button class="chip" data-cat="safety">安全性 / 政策</button><button class="chip" data-cat="research">研究</button><button class="chip" data-cat="business">企業 / 市場</button></div><div id="newsGrid" class="news-grid" aria-live="polite"></div></section>
+ </div></main>
+-<footer><div class="wrap footer-inner"><div class="footer-copy"><strong style="color:var(--ink)">AI BRIEF Ultra</strong><br>Google News RSSなどの公開情報をサーバー側で集約する個人向けニュースダッシュボード。記事本文を転載せず、タイトル・配信元・短い説明と原文への導線を提供します。</div><div class="footer-links"><a href="trending.html">急上昇</a><a href="about.html">仕組み</a></div></div></footer><div id="toast" class="toast"></div><script src="common.js"></script><script src="home.js"></script><script>if('serviceWorker' in navigator)navigator.serviceWorker.register('sw.js').catch(()=>{});</script></body></html>
++<footer><div class="wrap footer-inner"><div class="footer-copy"><strong class="footer-brand">AI BRIEF Ultra</strong><br>Google News RSSなどの公開情報をサーバー側で集約する個人向けニュースダッシュボード。記事本文を転載せず、タイトル・配信元・短い説明と原文への導線を提供します。</div><div class="footer-links"><a href="trending.html">急上昇</a><a href="about.html">仕組み</a></div></div></footer><div id="toast" class="toast"></div><script src="common.js"></script><script src="home.js"></script></body></html>
+diff --git a/public/manifest.webmanifest b/public/manifest.webmanifest
+index d6abebd..c7a977b 100644
+--- a/public/manifest.webmanifest
++++ b/public/manifest.webmanifest
+@@ -1,9 +1,15 @@
+ {
+   "name":"AI BRIEF Ultra",
+   "short_name":"AI BRIEF",
+-  "start_url":"/index.html",
++  "id":"./",
++  "start_url":"./index.html",
++  "scope":"./",
+   "display":"standalone",
+   "background_color":"#f2efe8",
+   "theme_color":"#f2efe8",
+-  "description":"最新AIニュースを自動収集・整理するニュースダッシュボード"
++  "description":"最新AIニュースを自動収集・整理するニュースダッシュボード",
++  "icons":[
++    {"src":"icons/icon-192.png","sizes":"192x192","type":"image/png","purpose":"any maskable"},
++    {"src":"icons/icon-512.png","sizes":"512x512","type":"image/png","purpose":"any maskable"}
++  ]
+ }
+diff --git a/public/openai.html b/public/openai.html
+index 2f8b1f6..d9a3c47 100644
+--- a/public/openai.html
++++ b/public/openai.html
+@@ -1,5 +1,5 @@
+-<!doctype html><html lang="ja"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="theme-color" content="#f2efe8"><link rel="stylesheet" href="styles.css"><title>OpenAI 最新ニュース — AI BRIEF Ultra</title></head><body>
++<!doctype html><html lang="ja"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="theme-color" content="#f2efe8"><link rel="manifest" href="manifest.webmanifest"><link rel="icon" href="icons/icon-192.png"><link rel="stylesheet" href="styles.css"><title>OpenAI 最新ニュース — AI BRIEF Ultra</title></head><body><a class="skip-link" href="#main-content">本文へ移動</a><noscript><div class="noscript">このサイトのニュース表示にはJavaScriptが必要です。</div></noscript>
+ <div class="topline"><div class="wrap"><div class="status-inline"><span id="statusDot" class="status-dot"></span><span id="statusText">自動取得を確認中…</span></div><div id="globalUpdated" class="top-small">最新情報を読み込み中</div></div></div>
+-<header><div class="wrap nav"><a class="brand" href="index.html"><span class="brandmark">AI</span><span>AI BRIEF<span class="brand-sub">ULTRA EDITION</span></span></a><button id="menuBtn" class="menu-btn" aria-expanded="false">☰</button><nav id="navLinks" class="navlinks"><a href="index.html">最新</a><a href="trending.html">急上昇</a><a href="openai.html">OpenAI</a><a href="google.html">Google</a><a href="anthropic.html">Anthropic</a><a href="about.html">このサイトについて</a><button id="refreshBtn" class="refresh-btn">↻ 更新</button></nav></div></header>
+-<main><div class="wrap"><section class="page-hero"><div class="page-hero-inner"><div><div class="kicker">Company Watch</div><h1 id="companyTitle">Company</h1><p id="companyDesc">企業別の最新AIニュースを自動抽出します。</p></div><div id="companyBadge" class="page-badge">読込中</div></div></section><section class="section"><div class="toolbar"><label class="searchbox"><span class="sr-only">検索</span><input id="searchInput" type="search" placeholder="この企業のニュースを検索"></label><select id="sortSelect" class="select"><option value="latest">新着順</option><option value="source">配信元順</option></select><div id="resultCount" class="countbox">読込中</div></div><div id="newsGrid" class="news-grid"></div></section></div></main>
++<header><div class="wrap nav"><a class="brand" href="index.html"><span class="brandmark">AI</span><span>AI BRIEF<span class="brand-sub">ULTRA EDITION</span></span></a><button id="menuBtn" class="menu-btn" type="button" aria-expanded="false" aria-label="メニュー">☰</button><nav id="navLinks" class="navlinks"><a href="index.html">最新</a><a href="trending.html">急上昇</a><a href="openai.html">OpenAI</a><a href="google.html">Google</a><a href="anthropic.html">Anthropic</a><a href="about.html">このサイトについて</a><button id="refreshBtn" class="refresh-btn" type="button">↻ 更新</button></nav></div></header>
++<main id="main-content" tabindex="-1"><div class="wrap"><section class="page-hero"><div class="page-hero-inner"><div><div class="kicker">Company Watch</div><h1 id="companyTitle">Company</h1><p id="companyDesc">企業別の最新AIニュースを自動抽出します。</p></div><div id="companyBadge" class="page-badge">読込中</div></div></section><section class="section"><div class="toolbar"><label class="searchbox"><span class="sr-only">検索</span><input id="searchInput" type="search" placeholder="この企業のニュースを検索"></label><select id="sortSelect" class="select"><option value="latest">新着順</option><option value="source">配信元順</option></select><div id="resultCount" class="countbox" role="status" aria-live="polite" aria-atomic="true">読込中</div></div><div id="newsGrid" class="news-grid" aria-live="polite"></div></section></div></main>
+ <footer><div class="wrap footer-inner"><div class="footer-copy">AI BRIEF Ultra — 企業名や製品名を含むニュースを自動分類しています。分類は完全ではないため、重要判断では必ず原文をご確認ください。</div><div class="footer-links"><a href="index.html">最新</a><a href="trending.html">急上昇</a></div></div></footer><div id="toast" class="toast"></div><script src="common.js"></script><script src="company.js"></script></body></html>
+diff --git a/public/styles.css b/public/styles.css
+index 5ebf6bc..0ee7bf6 100644
+--- a/public/styles.css
++++ b/public/styles.css
+@@ -4,7 +4,7 @@
+   --paper-2:#f8f5ee;
+   --ink:#1d2529;
+   --ink-soft:#354046;
+-  --muted:#73787a;
++  --muted:#5d6366;
+   --line:#d8d3c8;
+   --line-dark:#b9b2a5;
+   --blue:#425c6b;
+@@ -17,8 +17,12 @@
+   --max:1240px;
+ }
+ *{box-sizing:border-box}
++a:focus-visible,button:focus-visible,input:focus-visible,select:focus-visible,[tabindex]:focus-visible{outline:3px solid #1f658a;outline-offset:3px}
++.skip-link{position:fixed;z-index:999;left:12px;top:12px;transform:translateY(-180%);background:var(--ink);color:#fff;padding:10px 14px;border-radius:8px}.skip-link:focus{transform:none}
++.noscript{padding:12px;text-align:center;background:#fff4cf;color:#342b11;border-bottom:1px solid #b8a45d}
+ html{scroll-behavior:smooth}
+ body{margin:0;background:var(--bg);color:var(--ink);font-family:Inter,"Noto Sans JP","Hiragino Kaku Gothic ProN","Yu Gothic",system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;line-height:1.65;-webkit-font-smoothing:antialiased}
++.unstyled-link{ text-decoration:none }.footer-brand{color:var(--ink)}.loading-pad{padding:24px}
+ body::before{content:"";position:fixed;inset:0;pointer-events:none;background-image:linear-gradient(rgba(29,37,41,.024) 1px,transparent 1px),linear-gradient(90deg,rgba(29,37,41,.024) 1px,transparent 1px);background-size:30px 30px;z-index:-1}
+ a{color:inherit}button,input,select{font:inherit}.wrap{width:min(calc(100% - 34px),var(--max));margin-inline:auto}.sr-only{position:absolute!important;width:1px;height:1px;padding:0;margin:-1px;overflow:hidden;clip:rect(0,0,0,0);white-space:nowrap;border:0}
+ .topline{background:var(--ink);color:#f7f3ea;font-size:12px}.topline .wrap{min-height:34px;display:flex;align-items:center;justify-content:space-between;gap:20px}.status-inline{display:flex;align-items:center;gap:9px}.status-dot{width:7px;height:7px;border-radius:50%;background:#b8c0b2}.status-dot.warn{background:#d0a27d}.top-small{opacity:.72}
+@@ -35,6 +39,7 @@ main{padding:48px 0 80px}.hero{display:grid;grid-template-columns:minmax(0,1.35f
+ .info-grid{display:grid;grid-template-columns:1fr 1fr;gap:16px}.info-card{background:var(--paper);border:1px solid var(--line);border-radius:18px;padding:24px}.info-card h2{font-size:18px;margin-top:0}.info-card p,.info-card li{font-size:13px;color:#5e676b}
+ footer{border-top:1px solid var(--line);padding:30px 0 46px;color:var(--muted);font-size:11px}.footer-inner{display:grid;grid-template-columns:1fr auto;gap:28px}.footer-links{display:flex;gap:12px;flex-wrap:wrap}.footer-links a{text-decoration:none}.footer-copy{max-width:760px}
+ .toast{position:fixed;right:18px;bottom:18px;z-index:70;background:var(--ink);color:white;padding:11px 14px;border-radius:12px;font-size:11px;box-shadow:var(--shadow);opacity:0;transform:translateY(8px);pointer-events:none;transition:.2s}.toast.show{opacity:1;transform:translateY(0)}
++.load-more{display:block;margin:24px auto 0;border:1px solid var(--ink);background:var(--paper);color:var(--ink);border-radius:999px;padding:12px 22px;font:inherit;font-size:13px;font-weight:800;cursor:pointer}.load-more:hover{background:var(--ink);color:#fff}
+ @media(max-width:980px){.hero{grid-template-columns:1fr}.news-grid{grid-template-columns:repeat(2,minmax(0,1fr))}.article-shell{grid-template-columns:1fr}.article-aside{position:static}.navlinks{position:absolute;top:78px;left:0;right:0;background:var(--bg);border-bottom:1px solid var(--line);padding:12px 17px;display:none;flex-wrap:wrap}.navlinks.open{display:flex}.menu-btn{display:block}.refresh-btn{margin-left:0}.company-strip{grid-template-columns:1fr}.trend-row{grid-template-columns:44px 1fr 100px}.source-count{display:none}}
+ @media(max-width:650px){.wrap{width:min(calc(100% - 22px),var(--max))}.top-small{display:none}.hero-main{padding:28px 22px}.hero h1{font-size:49px}.lead-story{grid-template-columns:1fr}.hero-side{padding:21px}.news-grid{grid-template-columns:1fr}.toolbar{grid-template-columns:1fr 1fr}.searchbox{grid-column:1/-1}.section-head{align-items:start;flex-direction:column}.section-note{text-align:left}.page-hero-inner{grid-template-columns:1fr}.article-main{padding:26px 21px}.info-grid{grid-template-columns:1fr}.trend-row{grid-template-columns:34px 1fr 72px;padding:17px 14px;gap:10px}.trend-index{font-size:18px}.scorebox strong{font-size:18px}.footer-inner{grid-template-columns:1fr}.snapshot{grid-template-columns:1fr 1fr}}
+ @media(prefers-reduced-motion:reduce){*{scroll-behavior:auto!important;animation:none!important;transition:none!important}}
+diff --git a/public/sw.js b/public/sw.js
+index f5ed05d..c01f269 100644
+--- a/public/sw.js
++++ b/public/sw.js
+@@ -1,10 +1,19 @@
+-const SHELL_CACHE='ai-brief-shell-v2';
+-const DATA_CACHE='ai-brief-data-v2';
+-const SHELL=['/','/index.html','/trending.html','/openai.html','/google.html','/anthropic.html','/company.html','/article.html','/about.html','/styles.css','/common.js','/home.js','/company.js','/trending.js','/article.js','/manifest.webmanifest'];
+-self.addEventListener('install',event=>{event.waitUntil(caches.open(SHELL_CACHE).then(cache=>cache.addAll(SHELL)).then(()=>self.skipWaiting()))});
+-self.addEventListener('activate',event=>{event.waitUntil(caches.keys().then(keys=>Promise.all(keys.filter(k=>![SHELL_CACHE,DATA_CACHE].includes(k)).map(k=>caches.delete(k)))).then(()=>self.clients.claim()))});
+-async function cacheIfOk(cacheName,request,response){if(response&&response.ok){const cache=await caches.open(cacheName);await cache.put(request,response.clone())}return response}
+-async function apiNetworkFirst(request){try{const response=await fetch(request);if(response.ok)await cacheIfOk(DATA_CACHE,request,response);return response}catch{const cached=await caches.match(request);if(cached)return cached;return new Response(JSON.stringify({error:'offline_cache_miss'}),{status:503,headers:{'content-type':'application/json; charset=utf-8','cache-control':'no-store'}})}}
+-async function navigationNetworkFirst(request,url){try{const response=await fetch(request);if(response.ok)await cacheIfOk(SHELL_CACHE,request,response);return response}catch{const exact=await caches.match(request);if(exact)return exact;const shellPage=await caches.match(url.pathname);if(shellPage)return shellPage;return caches.match('/index.html')}}
+-async function assetStaleWhileRevalidate(event,request){const cached=await caches.match(request);const network=fetch(request).then(async response=>{if(response.ok)await cacheIfOk(SHELL_CACHE,request,response);return response}).catch(()=>null);if(cached){event.waitUntil(network);return cached}const response=await network;return response||new Response('Offline',{status:503,headers:{'content-type':'text/plain; charset=utf-8'}})}
+-self.addEventListener('fetch',event=>{const request=event.request;if(request.method!=='GET')return;const url=new URL(request.url);if(url.origin!==location.origin)return;if(url.pathname.startsWith('/api/')){event.respondWith(apiNetworkFirst(request));return}if(request.mode==='navigate'||request.destination==='document'){event.respondWith(navigationNetworkFirst(request,url));return}event.respondWith(assetStaleWhileRevalidate(event,request))});
++'use strict';
++
++const VERSION='__ASSET_VERSION__';
++const SHELL_CACHE=`${VERSION}-shell`;
++const DATA_CACHE=`${VERSION}-data`;
++const SHELL=['./','./index.html','./trending.html','./openai.html','./google.html','./anthropic.html','./company.html','./article.html','./about.html','./styles.css','./common.js','./home.js','./company.js','./trending.js','./article.js','./about.js','./manifest.webmanifest','./icons/icon-192.png','./icons/icon-512.png'];
++const scopeUrl=path=>new URL(path,self.registration.scope).href;
++
++async function installCaches(){const shell=await caches.open(SHELL_CACHE);await shell.addAll(SHELL.map(scopeUrl));try{const response=await fetch(scopeUrl('./data/news.json'),{cache:'reload'});if(response.ok){const data=await caches.open(DATA_CACHE);await data.put(scopeUrl('./data/news.json'),response)}}catch{}await self.skipWaiting()}
++self.addEventListener('install',event=>event.waitUntil(installCaches()));
++self.addEventListener('activate',event=>event.waitUntil(caches.keys().then(keys=>Promise.all(keys.filter(k=>k!==SHELL_CACHE&&k!==DATA_CACHE).map(k=>caches.delete(k)))).then(()=>self.clients.claim())));
++
++async function navigationResponse(request){try{const fresh=await fetch(request);if(!fresh.ok)throw new Error(`HTTP ${fresh.status}`);const cache=await caches.open(SHELL_CACHE);await cache.put(new Request(new URL(request.url).origin+new URL(request.url).pathname),fresh.clone());return fresh}catch{const url=new URL(request.url);const normalized=new Request(url.origin+url.pathname);return await caches.match(normalized)||await caches.match(scopeUrl('./index.html'))||Response.error()}}
++function markOffline(cached){if(!cached)return Response.error();const headers=new Headers(cached.headers);headers.set('x-ainews-cache','offline');return new Response(cached.body,{status:cached.status,statusText:cached.statusText,headers})}
++async function snapshotResponse(request){const cache=await caches.open(DATA_CACHE);try{const fresh=await fetch(request);if(!fresh.ok)throw new Error(`HTTP ${fresh.status}`);await cache.put(scopeUrl('./data/news.json'),fresh.clone());return fresh}catch{return markOffline(await cache.match(scopeUrl('./data/news.json')))}}
++async function apiSnapshotResponse(request){const cache=await caches.open(DATA_CACHE),key=scopeUrl('./api/snapshot');try{const fresh=await fetch(request);if(!fresh.ok)throw new Error(`HTTP ${fresh.status}`);await cache.put(key,fresh.clone());return fresh}catch{return markOffline(await cache.match(key))}}
++async function assetResponse(request){const normalized=new Request(new URL(request.url).origin+new URL(request.url).pathname);const cached=await caches.match(normalized);if(cached)return cached;const fresh=await fetch(request);if(fresh.ok){const cache=await caches.open(SHELL_CACHE);await cache.put(normalized,fresh.clone())}return fresh}
++
++self.addEventListener('fetch',event=>{const request=event.request;if(request.method!=='GET')return;const url=new URL(request.url);if(url.origin!==location.origin)return;if(url.pathname.endsWith('/data/news.json')){event.respondWith(snapshotResponse(request));return}if(url.pathname.endsWith('/api/snapshot')){event.respondWith(apiSnapshotResponse(request));return}if(url.pathname.includes('/api/'))return;if(request.mode==='navigate'){event.respondWith(navigationResponse(request));return}event.respondWith(assetResponse(request))});
+diff --git a/public/trending.html b/public/trending.html
+index 0ee2bc1..77b0d23 100644
+--- a/public/trending.html
++++ b/public/trending.html
+@@ -1,3 +1,3 @@
+-<!doctype html><html lang="ja"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="theme-color" content="#f2efe8"><link rel="stylesheet" href="styles.css"><title>急上昇AIニュース — AI BRIEF Ultra</title></head><body>
+-<div class="topline"><div class="wrap"><div class="status-inline"><span id="statusDot" class="status-dot"></span><span id="statusText">自動取得を確認中…</span></div><div id="globalUpdated" class="top-small">最新情報を読み込み中</div></div></div><header><div class="wrap nav"><a class="brand" href="index.html"><span class="brandmark">AI</span><span>AI BRIEF<span class="brand-sub">ULTRA EDITION</span></span></a><button id="menuBtn" class="menu-btn" aria-expanded="false">☰</button><nav id="navLinks" class="navlinks"><a href="index.html">最新</a><a class="active" href="trending.html">急上昇</a><a href="openai.html">OpenAI</a><a href="google.html">Google</a><a href="anthropic.html">Anthropic</a><a href="about.html">このサイトについて</a><button id="refreshBtn" class="refresh-btn">↻ 更新</button></nav></div></header>
+-<main><div class="wrap"><section class="page-hero"><div class="page-hero-inner"><div><div class="kicker">Momentum Ranking</div><h1>急上昇ニュース</h1><p>複数媒体で一斉に報じられているか、どれだけ新しいか、複数のAIトピック検索で検出されたかを統合してランキング化します。</p></div><div id="trendBadge" class="page-badge">算出中</div></div></section><section class="section"><div id="trendingList" class="trending-list"><div style="padding:24px">読込中…</div></div></section></div></main><footer><div class="wrap footer-inner"><div class="footer-copy">急上昇スコアはニュース価値の絶対評価ではありません。報道量と鮮度を中心にした、サイト内の相対的な指標です。</div><div class="footer-links"><a href="index.html">最新</a><a href="about.html">算出方法</a></div></div></footer><div id="toast" class="toast"></div><script src="common.js"></script><script src="trending.js"></script></body></html>
++<!doctype html><html lang="ja"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="theme-color" content="#f2efe8"><link rel="manifest" href="manifest.webmanifest"><link rel="icon" href="icons/icon-192.png"><link rel="stylesheet" href="styles.css"><title>急上昇AIニュース — AI BRIEF Ultra</title></head><body><a class="skip-link" href="#main-content">本文へ移動</a><noscript><div class="noscript">このサイトのニュース表示にはJavaScriptが必要です。</div></noscript>
++<div class="topline"><div class="wrap"><div class="status-inline"><span id="statusDot" class="status-dot"></span><span id="statusText">自動取得を確認中…</span></div><div id="globalUpdated" class="top-small">最新情報を読み込み中</div></div></div><header><div class="wrap nav"><a class="brand" href="index.html"><span class="brandmark">AI</span><span>AI BRIEF<span class="brand-sub">ULTRA EDITION</span></span></a><button id="menuBtn" class="menu-btn" type="button" aria-expanded="false" aria-label="メニュー">☰</button><nav id="navLinks" class="navlinks"><a href="index.html">最新</a><a class="active" href="trending.html">急上昇</a><a href="openai.html">OpenAI</a><a href="google.html">Google</a><a href="anthropic.html">Anthropic</a><a href="about.html">このサイトについて</a><button id="refreshBtn" class="refresh-btn" type="button">↻ 更新</button></nav></div></header>
++<main id="main-content" tabindex="-1"><div class="wrap"><section class="page-hero"><div class="page-hero-inner"><div><div class="kicker">Momentum Ranking</div><h1>急上昇ニュース</h1><p>複数媒体で一斉に報じられているか、どれだけ新しいか、複数のAIトピック検索で検出されたかを統合してランキング化します。</p></div><div id="trendBadge" class="page-badge">算出中</div></div></section><section class="section"><div id="trendingList" class="trending-list"><div class="loading-pad">読込中…</div></div></section></div></main><footer><div class="wrap footer-inner"><div class="footer-copy">急上昇スコアはニュース価値の絶対評価ではありません。報道量と鮮度を中心にした、サイト内の相対的な指標です。</div><div class="footer-links"><a href="index.html">最新</a><a href="about.html">算出方法</a></div></div></footer><div id="toast" class="toast"></div><script src="common.js"></script><script src="trending.js"></script></body></html>
+diff --git a/public/trending.js b/public/trending.js
+index f545deb..8894d1d 100644
+--- a/public/trending.js
++++ b/public/trending.js
+@@ -1 +1,5 @@
+-async function init(){const box=$('#trendingList');if(!box)return;try{const data=await api('/api/trending?limit=25');updateGlobalStatus(data.meta);const items=Array.isArray(data.items)?data.items:[];$('#trendBadge').textContent=`${modeLabel(data.meta?.mode)} · TOP ${items.length}`;box.innerHTML=items.map((x,i)=>{const score=Number(x.score),sources=Math.max(0,Number(x.sourceCount)||0),mentions=Math.max(0,Number(x.mentionCount)||0),queries=Math.max(0,Number(x.queryCount)||0);return`<div class="trend-row"><div class="trend-index">${String(i+1).padStart(2,'0')}</div><div><h2><a href="${articleHref(x.id)}">${esc(x.title||'タイトル不明')}</a></h2><div class="trend-meta">${esc(x.source||'配信元不明')} · ${esc(ago(x.publishedAt))} · ${queries}トピックで検出</div></div><div class="source-count">${sources}媒体<br>${mentions}件の近似記事</div><div class="scorebox"><strong>${Number.isFinite(score)?Math.round(score):'—'}</strong><span>TREND SCORE</span></div></div>`}).join('')||'<div class="empty">急上昇データがありません。</div>'}catch(e){box.innerHTML='<div class="errorbox"><strong>ランキング取得に失敗しました</strong>サーバーまたはオフラインキャッシュを確認してください。</div>'}}init();
++'use strict';
++
++function renderTrending(items){const list=$('#trendingList');const rows=Array.isArray(items)?items:[];list.innerHTML=rows.length?rows.map((x,i)=>`<article class="trend-row"><div class="trend-index">${String(i+1).padStart(2,'0')}</div><div><h2><a href="${articleHref(x.id)}">${esc(x.title||'タイトル不明')}</a></h2><div class="trend-meta">${esc(x.source||'配信元不明')} · ${esc(ago(x.publishedAt))}</div></div><div class="source-count">${Number(x.sourceCount)||0}媒体<br>${Number(x.queryCount)||0}トピック</div><div class="scorebox"><strong>${Number.isFinite(Number(x.score))?Math.round(Number(x.score)):'—'}</strong><span>MOMENTUM</span></div></article>`).join(''):'<div class="empty">急上昇データがありません。</div>'}
++async function init(){try{const data=await api('/api/trending?limit=50');renderTrending(data.items);updateGlobalStatus(data.meta);if($('#trendBadge'))$('#trendBadge').textContent=`${modeLabel(data.meta?.mode)} · ${data.items?.length||0} CLUSTERS`}catch(e){$('#trendingList').innerHTML='<div class="errorbox"><strong>急上昇を取得できませんでした</strong>保存データを確認してください。</div>';if($('#trendBadge'))$('#trendBadge').textContent='ERROR'}}
++init();
+diff --git a/scripts/build-pages.js b/scripts/build-pages.js
+new file mode 100644
+index 0000000..58fd776
+--- /dev/null
++++ b/scripts/build-pages.js
+@@ -0,0 +1,35 @@
++'use strict';
++
++const fs = require('fs');
++const fsp = fs.promises;
++const path = require('path');
++const crypto = require('crypto');
++const { refreshNews } = require('../server');
++
++const root = path.join(__dirname, '..');
++const publicDir = path.join(root, 'public');
++const distDir = path.join(root, 'dist');
++
++async function main() {
++  await fsp.rm(distDir, { recursive: true, force: true });
++  await fsp.cp(publicDir, distDir, { recursive: true });
++  const payload = await refreshNews({ force: true });
++  const snapshot = { ...payload, delivery: 'static-snapshot', snapshotBuiltAt: new Date().toISOString() };
++  await fsp.mkdir(path.join(distDir, 'data'), { recursive: true });
++  await fsp.writeFile(path.join(distDir, 'data', 'news.json'), JSON.stringify(snapshot), 'utf8');
++  await fsp.writeFile(path.join(distDir, '.nojekyll'), '', 'utf8');
++
++  const assetFiles = ['common.js','home.js','company.js','trending.js','article.js','about.js','styles.css','manifest.webmanifest','sw.js'];
++  const hash = crypto.createHash('sha256');
++  for (const file of assetFiles) {
++    const target = path.join(distDir, file);
++    if (fs.existsSync(target)) hash.update(await fsp.readFile(target));
++  }
++  const version = `ainews-${hash.digest('hex').slice(0, 12)}`;
++  const swPath = path.join(distDir, 'sw.js');
++  const sw = (await fsp.readFile(swPath, 'utf8')).replace('__ASSET_VERSION__', version);
++  await fsp.writeFile(swPath, sw, 'utf8');
++  console.log(`GitHub Pages bundle created: ${snapshot.articles.length} articles, ${version}`);
++}
++
++main().catch(err => { console.error(err); process.exitCode = 1; });
+diff --git a/scripts/generate-icons.js b/scripts/generate-icons.js
+new file mode 100644
+index 0000000..6ca8552
+--- /dev/null
++++ b/scripts/generate-icons.js
+@@ -0,0 +1,60 @@
++'use strict';
++
++const fs = require('fs');
++const path = require('path');
++const zlib = require('zlib');
++
++const outputDir = path.join(__dirname, '..', 'public', 'icons');
++
++function crc32(buffer) {
++  let crc = 0xffffffff;
++  for (const byte of buffer) {
++    crc ^= byte;
++    for (let i = 0; i < 8; i++) crc = (crc >>> 1) ^ (0xedb88320 & -(crc & 1));
++  }
++  return (crc ^ 0xffffffff) >>> 0;
++}
++
++function chunk(type, data) {
++  const name = Buffer.from(type);
++  const length = Buffer.alloc(4); length.writeUInt32BE(data.length);
++  const checksum = Buffer.alloc(4); checksum.writeUInt32BE(crc32(Buffer.concat([name, data])));
++  return Buffer.concat([length, name, data, checksum]);
++}
++
++function makeIcon(size) {
++  const rowBytes = size * 4 + 1;
++  const raw = Buffer.alloc(rowBytes * size);
++  const paper = [242, 239, 232, 255];
++  const ink = [31, 43, 48, 255];
++  const rust = [157, 72, 49, 255];
++  const margin = Math.floor(size * 0.14);
++  const stroke = Math.max(5, Math.floor(size * 0.075));
++  const split = Math.floor(size * 0.6);
++  for (let y = 0; y < size; y++) {
++    raw[y * rowBytes] = 0;
++    for (let x = 0; x < size; x++) {
++      let color = paper;
++      const aLeft = x >= margin && x < margin + stroke && y >= split - x / 2 && y <= size - margin;
++      const aRight = x >= split - stroke && x < split && y >= margin + x / 2 && y <= size - margin;
++      const aBar = y >= split && y < split + stroke && x >= margin + stroke && x < split - stroke;
++      const iStem = x >= Math.floor(size * 0.7) && x < Math.floor(size * 0.7) + stroke && y >= margin + stroke * 2 && y < size - margin;
++      const iDot = x >= Math.floor(size * 0.7) && x < Math.floor(size * 0.7) + stroke && y >= margin && y < margin + stroke;
++      if (aLeft || aRight || aBar || iStem) color = ink;
++      if (iDot) color = rust;
++      const at = y * rowBytes + 1 + x * 4;
++      raw.set(color, at);
++    }
++  }
++  const ihdr = Buffer.alloc(13);
++  ihdr.writeUInt32BE(size, 0); ihdr.writeUInt32BE(size, 4);
++  ihdr[8] = 8; ihdr[9] = 6;
++  return Buffer.concat([
++    Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]),
++    chunk('IHDR', ihdr), chunk('IDAT', zlib.deflateSync(raw, { level: 9 })), chunk('IEND', Buffer.alloc(0))
++  ]);
++}
++
++fs.mkdirSync(outputDir, { recursive: true });
++for (const size of [192, 512]) fs.writeFileSync(path.join(outputDir, `icon-${size}.png`), makeIcon(size));
++
+diff --git a/scripts/upgrade-html.js b/scripts/upgrade-html.js
+new file mode 100644
+index 0000000..516f625
+--- /dev/null
++++ b/scripts/upgrade-html.js
+@@ -0,0 +1,25 @@
++'use strict';
++
++const fs = require('fs');
++const path = require('path');
++const publicDir = path.join(__dirname, '..', 'public');
++for (const name of fs.readdirSync(publicDir).filter(x => x.endsWith('.html'))) {
++  const file = path.join(publicDir, name);
++  let html = fs.readFileSync(file, 'utf8');
++  if (!html.includes('rel="manifest"')) html = html.replace('<link rel="stylesheet"', '<link rel="manifest" href="manifest.webmanifest"><link rel="stylesheet"');
++  if (!html.includes('rel="icon"')) html = html.replace('<link rel="stylesheet"', '<link rel="icon" href="icons/icon-192.png"><link rel="stylesheet"');
++  const accessIntro = '<a class="skip-link" href="#main-content">本文へ移動</a><noscript><div class="noscript">このサイトのニュース表示にはJavaScriptが必要です。</div></noscript>';
++  while (html.includes(accessIntro + accessIntro)) html = html.replace(accessIntro + accessIntro, accessIntro);
++  if (!html.includes('class="skip-link"')) html = html.replace('<body>', `<body>${accessIntro}`);
++  html = html.replace('<main>', '<main id="main-content" tabindex="-1">');
++  html = html.replace(/<button id="menuBtn" class="menu-btn"(?: type="button")? aria-expanded="false"(?: aria-label="メニュー")?>/g, '<button id="menuBtn" class="menu-btn" type="button" aria-expanded="false" aria-label="メニュー">');
++  html = html.replace(/<button id="refreshBtn" class="refresh-btn">/g, '<button id="refreshBtn" class="refresh-btn" type="button">');
++  html = html.replace(/id="resultCount" class="countbox"(?: role="status"| aria-live="polite"| aria-atomic="true")*/g, 'id="resultCount" class="countbox" role="status" aria-live="polite" aria-atomic="true"');
++  html = html.replace(/id="newsGrid" class="news-grid"(?: aria-live="polite")*/g, 'id="newsGrid" class="news-grid" aria-live="polite"');
++  html = html.replace(/<script>if\('serviceWorker'[\s\S]*?<\/script>/g, '');
++  html = html.replace(/<script>api\('\/api\/news\?limit=1'\)[\s\S]*?<\/script>/g, '<script src="about.js"></script>');
++  html = html.replace('href="trending.html" style="text-decoration:none"', 'href="trending.html" class="unstyled-link"');
++  html = html.replace('<strong style="color:var(--ink)">AI BRIEF Ultra</strong>', '<strong class="footer-brand">AI BRIEF Ultra</strong>');
++  html = html.replace('<div style="padding:24px">読込中…</div>', '<div class="loading-pad">読込中…</div>');
++  fs.writeFileSync(file, html, 'utf8');
++}
+diff --git a/server.js b/server.js
+index b2e60d3..e3bb757 100644
+--- a/server.js
++++ b/server.js
+@@ -12,16 +12,37 @@ const gzipAsync = promisify(zlib.gzip);
+ const PORT = envNumber('PORT', 8787, 1, 65535);
+ const HOST = process.env.HOST || '127.0.0.1';
+ const PUBLIC_DIR = path.join(__dirname, 'public');
+-const DATA_DIR = path.join(__dirname, 'data');
++const DATA_DIR = path.resolve(process.env.DATA_DIR || path.join(__dirname, 'data'));
+ const CACHE_FILE = path.join(DATA_DIR, 'cache.json');
+-const FALLBACK_FILE = path.join(DATA_DIR, 'fallback.json');
++const FALLBACK_FILE = path.resolve(process.env.FALLBACK_FILE || path.join(DATA_DIR, 'fallback.json'));
++const RUNTIME_FILE = path.join(DATA_DIR, 'runtime-state.json');
++const REFRESH_LOCK_FILE = path.join(DATA_DIR, 'refresh.lock');
++const RATE_LOCK_FILE = path.join(DATA_DIR, 'rate.lock');
+ const CACHE_TTL_MS = envNumber('CACHE_TTL_MS', 10 * 60 * 1000, 5_000, 7 * 24 * 60 * 60 * 1000);
+ const HARD_STALE_MS = envNumber('HARD_STALE_MS', 24 * 60 * 60 * 1000, CACHE_TTL_MS, 30 * 24 * 60 * 60 * 1000);
+ const FETCH_TIMEOUT_MS = envNumber('FETCH_TIMEOUT_MS', 8500, 1000, 60_000);
+ const REFRESH_MIN_INTERVAL_MS = envNumber('REFRESH_MIN_INTERVAL_MS', 60_000, 10_000, 60 * 60 * 1000);
+ const FORCE_IP_INTERVAL_MS = envNumber('FORCE_IP_INTERVAL_MS', 5 * 60 * 1000, REFRESH_MIN_INTERVAL_MS, 24 * 60 * 60 * 1000);
+-const USER_AGENT = 'AI-Brief-Ultra/1.1 (+local news aggregator)';
+-const CACHE_SCHEMA = 2;
++const USER_AGENT = 'AI-Brief-Ultra/1.2 (+local news aggregator)';
++const CACHE_SCHEMA = 3;
++const MAX_RSS_BYTES = 5_000_000;
++const MAX_ARTICLES = 180;
++const CLUSTER_WINDOW_MS = 48 * 60 * 60 * 1000;
++const EXACT_WINDOW_MS = 48 * 60 * 60 * 1000;
++const TRUST_PROXY = process.env.TRUST_PROXY === '1';
++const ENFORCE_HTTPS = process.env.ENFORCE_HTTPS === '1';
++const PUBLIC_ORIGIN = (() => {
++  if (!process.env.PUBLIC_ORIGIN) return '';
++  try {
++    const value = new URL(process.env.PUBLIC_ORIGIN);
++    return value.protocol === 'https:' && !value.username && !value.password ? value.origin : '';
++  } catch { return ''; }
++})();
++if (ENFORCE_HTTPS && !PUBLIC_ORIGIN) throw new Error('PUBLIC_ORIGIN=https://example.com is required when ENFORCE_HTTPS=1');
++const ASSET_FILES = ['common.js','home.js','company.js','trending.js','article.js','about.js','styles.css','manifest.webmanifest','sw.js'];
++const ASSET_VERSION = `ainews-${crypto.createHash('sha256').update(ASSET_FILES.map(file => {
++  try { return fs.readFileSync(path.join(PUBLIC_DIR, file)); } catch { return Buffer.alloc(0); }
++}).reduce((all, value) => Buffer.concat([all, value]), Buffer.alloc(0))).digest('hex').slice(0, 12)}`;
+ 
+ const feeds = [
+   { key: 'global', label: 'AI総合', locale: 'en-US', region: 'US', query: '"artificial intelligence" when:2d' },
+@@ -39,8 +60,10 @@ let refreshPromise = null;
+ let lastRefreshAttemptAt = 0;
+ let nextRefreshAllowedAt = 0;
+ let consecutiveRefreshFailures = 0;
++let refreshStateUpdatedAt = 0;
+ let lastForceRefreshAt = 0;
+ const forceByIp = new Map();
++let shuttingDown = false;
+ 
+ function envNumber(name, fallback, min, max) {
+   const n = Number(process.env[name]);
+@@ -65,11 +88,70 @@ function decodeXml(s = '') {
+     .replace(/&lt;/g, '<')
+     .replace(/&gt;/g, '>')
+     .replace(/&quot;/g, '"')
++    .replace(/&nbsp;/gi, ' ')
++    .replace(/&ndash;/gi, '–')
++    .replace(/&mdash;/gi, '—')
++    .replace(/&hellip;/gi, '…')
+     .replace(/&#39;|&apos;/g, "'")
+     .replace(/&#(\d+);/g, (_, n) => decodeCodePoint(n))
+     .replace(/&#x([0-9a-f]+);/gi, (_, n) => decodeCodePoint(parseInt(n, 16)));
+ }
+ 
++function truncateCodePoints(value, max, suffix = '') {
++  const chars = [...String(value || '')];
++  if (chars.length <= max) return chars.join('');
++  return chars.slice(0, Math.max(0, max - [...suffix].length)).join('').trimEnd() + suffix;
++}
++
++function parseTagAt(xml, start) {
++  if (xml[start] !== '<') return null;
++  if (xml.startsWith('<!--', start)) {
++    const end = xml.indexOf('-->', start + 4);
++    return { special: true, end: end < 0 ? xml.length : end + 3 };
++  }
++  if (xml.startsWith('<![CDATA[', start)) {
++    const end = xml.indexOf(']]>', start + 9);
++    return { special: true, end: end < 0 ? xml.length : end + 3 };
++  }
++  let end = start + 1;
++  let quote = '';
++  for (; end < xml.length; end++) {
++    const ch = xml[end];
++    if (quote) { if (ch === quote) quote = ''; }
++    else if (ch === '"' || ch === "'") quote = ch;
++    else if (ch === '>') break;
++  }
++  if (end >= xml.length) return null;
++  const raw = xml.slice(start + 1, end).trim();
++  if (!raw || raw[0] === '!' || raw[0] === '?') return { special: true, end: end + 1 };
++  const closing = raw[0] === '/';
++  const body = closing ? raw.slice(1).trim() : raw;
++  const selfClosing = !closing && /\/$/.test(body);
++  const name = (body.match(/^([^\s/>]+)/) || [,''])[1].toLowerCase();
++  return { name, closing, selfClosing, raw: body, end: end + 1 };
++}
++
++function elementBlocks(xml, wanted) {
++  const source = String(xml || '');
++  const name = String(wanted).toLowerCase();
++  const out = [];
++  const stack = [];
++  let pos = 0;
++  while ((pos = source.indexOf('<', pos)) >= 0) {
++    const tag = parseTagAt(source, pos);
++    if (!tag) break;
++    if (!tag.special && tag.name === name) {
++      if (!tag.closing && !tag.selfClosing) stack.push({ contentStart: tag.end, openStart: pos, tag });
++      else if (tag.closing && stack.length) {
++        const open = stack.pop();
++        if (!stack.length) out.push({ content: source.slice(open.contentStart, pos), openTag: open.tag.raw });
++      }
++    }
++    pos = Math.max(tag.end, pos + 1);
++  }
++  return out;
++}
++
+ function stripHtml(s = '') {
+   return decodeXml(String(s))
+     .replace(/<script\b[\s\S]*?<\/script>/gi, ' ')
+@@ -80,23 +162,42 @@ function stripHtml(s = '') {
+ }
+ 
+ function pickTagRaw(block, tag) {
+-  const safeTag = String(tag).replace(/[^A-Za-z0-9:_-]/g, '');
+-  const m = String(block).match(new RegExp(`<${safeTag}(?:\\s[^>]*)?>([\\s\\S]*?)<\\/${safeTag}>`, 'i'));
+-  return m ? m[1].trim() : '';
++  return elementBlocks(block, String(tag).replace(/[^A-Za-z0-9:_-]/g, ''))[0]?.content?.trim() || '';
+ }
+ 
+ function pickSource(block) {
+-  const m = String(block).match(/<source(?:\s+url="([^"]*)")?[^>]*>([\s\S]*?)<\/source>/i);
+-  return m ? { url: safeHttpUrl(decodeXml(m[1] || '')), name: stripHtml(m[2] || '') } : { url: '', name: '' };
++  const node = elementBlocks(block, 'source')[0];
++  if (!node) return { url: '', name: '' };
++  const attrs = node.openTag.replace(/^source\b/i, '');
++  const match = attrs.match(/(?:^|\s)url\s*=\s*(?:"([^"]*)"|'([^']*)')/i);
++  return { url: safeHttpUrl(decodeXml(match?.[1] || match?.[2] || '')), name: stripHtml(node.content) };
+ }
+ 
+ function safeHttpUrl(value) {
+   try {
+     const u = new URL(String(value || '').trim());
+-    return u.protocol === 'https:' || u.protocol === 'http:' ? u.href : '';
++    if (u.protocol !== 'https:' || u.username || u.password) return '';
++    const host = u.hostname.toLowerCase().replace(/^\[|\]$/g, '');
++    if (!host || host === 'localhost' || host.endsWith('.localhost') || host === '::1' || host === '0:0:0:0:0:0:0:1') return '';
++    const ipv4 = host.match(/^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/);
++    if (ipv4) {
++      const octets = ipv4.slice(1).map(Number);
++      if (octets.some(x => x > 255) || octets[0] === 10 || octets[0] === 127 || octets[0] === 0 ||
++          (octets[0] === 169 && octets[1] === 254) || (octets[0] === 172 && octets[1] >= 16 && octets[1] <= 31) ||
++          (octets[0] === 192 && octets[1] === 168) || octets[0] >= 224) return '';
++    }
++    if (host.includes(':') && (/^(fc|fd|fe8|fe9|fea|feb)/i.test(host) || host === '::')) return '';
++    return u.href;
+   } catch { return ''; }
+ }
+ 
++function isGenericPublisherUrl(value) {
++  try {
++    const pathname = new URL(value).pathname.replace(/\/+$/, '') || '/';
++    return pathname === '/' || /^\/(news|blog)$/i.test(pathname);
++  } catch { return true; }
++}
++
+ function normalizeTitle(title = '') {
+   return String(title)
+     .toLowerCase()
+@@ -118,7 +219,13 @@ function tokenSet(title = '') {
+     if (/^[a-z]+$/i.test(w)) {
+       if (w.length >= 2 && !stop.has(w)) tokens.add(w);
+       const next = words[i + 1];
+-      if (next && /^\d+(?:\.\d+)*$/.test(next) && /^(gpt|gemini|claude|llama|opus|sonnet|flash)$/i.test(w)) tokens.add(`${w}:${next}`);
++      if (next && /^\d+(?:\.\d+)*$/.test(next) && /^(gpt|gemini|claude|llama|opus|sonnet|flash)$/i.test(w)) {
++        tokens.add(`model:${w}:${next}`);
++        const suffix = words[i + 2];
++        if (suffix && /^(o|pro|flash|mini|turbo)$/i.test(suffix)) tokens.add(`model:${w}:${next}:${suffix}`);
++      }
++      const next2 = words[i + 2];
++      if (next2 && /^\d+(?:\.\d+)*$/.test(next2) && /^(gpt|gemini|claude|llama)$/i.test(w) && /^(o|pro|flash|mini|turbo)$/i.test(next || '')) tokens.add(`model:${w}:${next}:${next2}`);
+     } else if (/^\d/.test(w)) {
+       tokens.add(`#${w}`);
+     } else {
+@@ -153,18 +260,26 @@ function containsTerm(text, term) {
+ function hasAny(text, terms) { return terms.some(t => containsTerm(text, t)); }
+ 
+ function classify(article) {
+-  const text = `${article?.title || ''} ${article?.source || ''}`.toLowerCase().normalize('NFKC');
++  const text = `${article?.title || ''} ${article?.summary || ''} ${article?.source || ''}`.toLowerCase().normalize('NFKC');
+   const categories = new Set();
+   const companies = new Set();
+ 
+-  if (hasAny(text, ['openai','chatgpt','gpt','codex'])) companies.add('openai');
+-  if (hasAny(text, ['google','deepmind','gemini','gemma'])) companies.add('google');
+-  if (hasAny(text, ['anthropic','claude'])) companies.add('anthropic');
+-  if (hasAny(text, ['nvidia','cuda','rubin','blackwell'])) companies.add('nvidia');
++  const falseContext = {
++    openai: /\b(ancient|medieval|manuscript|book)\s+codex\b/i,
++    google: /\b(gemini\s+(horoscope|zodiac|astrology)|project\s+gemini|gemini\s+spacecraft)\b/i,
++    anthropic: /\bclaude\s+monet\b/i,
++    nvidia: /\bblackwell\s+(school|academy|publishing|bookshop)\b/i,
++    amazon: /\bamazon\s+(rainforest|river|basin|tribe|forest)\b/i
++  };
++
++  if (hasAny(text, ['openai','chatgpt','gpt','codex']) && !falseContext.openai.test(text)) companies.add('openai');
++  if (hasAny(text, ['google','deepmind','gemini','gemma']) && !falseContext.google.test(text)) companies.add('google');
++  if (hasAny(text, ['anthropic','claude']) && !falseContext.anthropic.test(text)) companies.add('anthropic');
++  if (hasAny(text, ['nvidia','cuda','rubin','blackwell']) && !falseContext.nvidia.test(text)) companies.add('nvidia');
+   if (hasAny(text, ['meta','llama'])) companies.add('meta');
+   if (hasAny(text, ['microsoft','copilot','azure'])) companies.add('microsoft');
+   if (hasAny(text, ['xai','grok'])) companies.add('xai');
+-  if (hasAny(text, ['amazon','aws'])) companies.add('amazon');
++  if (hasAny(text, ['amazon','aws']) && !falseContext.amazon.test(text)) companies.add('amazon');
+ 
+   if (hasAny(text, ['model','models','gpt','gemini','claude','llama','benchmark','reasoning','agent','モデル','推論','エージェント','ベンチマーク'])) categories.add('models');
+   if (hasAny(text, ['chip','chips','gpu','data center','datacenter','compute','nvidia','semiconductor','cloud','チップ','半導体','データセンター','計算資源','クラウド','gpu'])) categories.add('infrastructure');
+@@ -177,9 +292,16 @@ function classify(article) {
+ }
+ 
+ function normalizePublishedAt(raw, now = Date.now()) {
+-  const ms = Date.parse(String(raw || ''));
++  const value = String(raw || '').trim();
++  const isoDate = value.match(/^(\d{4})-(\d{2})-(\d{2})(?:T|$)/);
++  if (isoDate) {
++    const year = Number(isoDate[1]), month = Number(isoDate[2]), day = Number(isoDate[3]);
++    const check = new Date(Date.UTC(year, month - 1, day));
++    if (check.getUTCFullYear() !== year || check.getUTCMonth() !== month - 1 || check.getUTCDate() !== day) return null;
++  }
++  const ms = Date.parse(value);
+   if (!Number.isFinite(ms)) return null;
+-  if (ms > now + 15 * 60 * 1000) return new Date(now).toISOString();
++  if (ms > now) return null;
+   return new Date(ms).toISOString();
+ }
+ 
+@@ -190,8 +312,9 @@ function articleTime(a) {
+ 
+ function parseRss(xml, feed) {
+   const out = [];
+-  const items = String(xml).match(/<item\b[\s\S]*?<\/item>/gi) || [];
+-  for (const block of items.slice(0, 45)) {
++  const items = elementBlocks(xml, 'item');
++  for (const item of items) {
++    const block = item.content;
+     let title = stripHtml(pickTagRaw(block, 'title'));
+     const link = safeHttpUrl(stripHtml(pickTagRaw(block, 'link')));
+     const pubDateRaw = stripHtml(pickTagRaw(block, 'pubDate'));
+@@ -203,8 +326,13 @@ function parseRss(xml, feed) {
+     if (source.name && title.endsWith(` - ${source.name}`)) title = title.slice(0, -(` - ${source.name}`.length));
+ 
+     const publishedAt = normalizePublishedAt(pubDateRaw);
+-    if (description.length > 560) description = description.slice(0, 557).trimEnd() + '…';
+-    if (description.toLowerCase() === title.toLowerCase()) description = '';
++    if (pubDateRaw && !publishedAt) continue;
++    description = truncateCodePoints(description, 560, '…');
++    const normalizedDescription = normalizeTitle(description);
++    const redundant = normalizedDescription === normalizeTitle(title) ||
++      normalizedDescription === normalizeTitle(`${title} ${source.name || ''}`) ||
++      normalizedDescription.startsWith(normalizeTitle(`${title} ${source.name || ''}`));
++    if (redundant) description = '';
+ 
+     const article = {
+       id: stableId(guid || link || title),
+@@ -223,11 +351,13 @@ function parseRss(xml, feed) {
+     };
+     Object.assign(article, classify(article));
+     out.push(article);
++    if (out.length >= 45) break;
+   }
+   return out;
+ }
+ 
+ async function fetchText(url, timeoutMs = FETCH_TIMEOUT_MS) {
++  if (process.env.DISABLE_NETWORK === '1') throw new Error('network disabled');
+   const controller = new AbortController();
+   const timer = setTimeout(() => controller.abort(), timeoutMs);
+   try {
+@@ -237,59 +367,73 @@ async function fetchText(url, timeoutMs = FETCH_TIMEOUT_MS) {
+       redirect: 'follow'
+     });
+     if (!res.ok) throw new Error(`HTTP ${res.status}`);
+-    const text = await res.text();
+-    if (text.length > 5_000_000) throw new Error('RSS response too large');
+-    return text;
++    const type = String(res.headers.get('content-type') || '').toLowerCase();
++    if (!/(?:application|text)\/(?:rss\+xml|atom\+xml|xml|[^;]+\+xml)/.test(type)) throw new Error(`Unexpected RSS content-type: ${type || 'missing'}`);
++    if (Number(res.headers.get('content-length') || 0) > MAX_RSS_BYTES) throw new Error('RSS response too large');
++    const reader = res.body?.getReader();
++    if (!reader) throw new Error('RSS response body missing');
++    const chunks = [];
++    let size = 0;
++    while (true) {
++      const { done, value } = await reader.read();
++      if (done) break;
++      size += value.byteLength;
++      if (size > MAX_RSS_BYTES) { await reader.cancel(); throw new Error('RSS response too large'); }
++      chunks.push(value);
++    }
++    return new TextDecoder('utf-8', { fatal: true }).decode(Buffer.concat(chunks.map(x => Buffer.from(x))));
+   } finally {
+     clearTimeout(timer);
+   }
+ }
+ 
+ function mergeExact(items) {
+-  const map = new Map();
+-  for (const item of items) {
++  const groups = new Map();
++  for (const item of [...items].sort((a, b) => articleTime(b) - articleTime(a))) {
+     const key = normalizeTitle(item.title);
+     if (!key) continue;
+-    if (!map.has(key)) {
+-      map.set(key, {
++    const candidates = groups.get(key) || [];
++    const currentTime = articleTime(item);
++    let prev = candidates.find(x => {
++      const previousTime = articleTime(x);
++      return item.url === x.url || !currentTime || !previousTime || Math.abs(currentTime - previousTime) <= EXACT_WINDOW_MS;
++    });
++    if (!prev) {
++      prev = {
+         ...item,
+         feedKeys: [...new Set(item.feedKeys || [])],
+         feedLabels: [...new Set(item.feedLabels || [])],
+         companies: [...new Set(item.companies || [])],
+         categories: [...new Set(item.categories || [])],
+         sourceNames: [...new Set(item.sourceNames || [item.source])],
+-        mentionCount: Math.max(1, Number(item.mentionCount) || 1)
+-      });
++        mentionCount: 1
++      };
++      candidates.push(prev);
++      groups.set(key, candidates);
+       continue;
+     }
+ 
+-    const prev = map.get(key);
+     prev.feedKeys = [...new Set([...prev.feedKeys, ...(item.feedKeys || [])])];
+     prev.feedLabels = [...new Set([...prev.feedLabels, ...(item.feedLabels || [])])];
+     prev.companies = [...new Set([...prev.companies, ...(item.companies || [])])];
+     prev.categories = [...new Set([...prev.categories, ...(item.categories || [])])];
+     prev.sourceNames = [...new Set([...prev.sourceNames, ...(item.sourceNames || [item.source])])];
+-    prev.mentionCount += Math.max(1, Number(item.mentionCount) || 1);
+-
+-    if (articleTime(item) > articleTime(prev)) {
+-      const keepId = prev.id;
+-      const mergedFields = {
+-        title: item.title,
+-        url: item.url,
+-        sourceUrl: item.sourceUrl,
+-        source: item.source,
+-        publishedAt: item.publishedAt,
+-        summary: item.summary || prev.summary,
+-        locale: item.locale,
+-        origin: item.origin
+-      };
+-      Object.assign(prev, mergedFields);
+-      prev.id = keepId;
+-    } else if (!prev.summary && item.summary) {
+-      prev.summary = item.summary;
+-    }
++    prev.mentionCount = prev.sourceNames.length;
++    if (!prev.summary && item.summary) prev.summary = item.summary;
+   }
+-  return [...map.values()];
++  return [...groups.values()].flat();
++}
++
++function modelTokens(tokens) {
++  return [...tokens].filter(x => x.startsWith('model:'));
++}
++
++function modelVersionsCompatible(left, right) {
++  const a = modelTokens(left), b = modelTokens(right);
++  if (!a.length || !b.length) return true;
++  const family = x => x.split(':').slice(0, 2).join(':');
++  for (const x of a) for (const y of b) if (family(x) === family(y) && x !== y) return false;
++  return true;
+ }
+ 
+ function buildClusters(articles) {
+@@ -301,27 +445,26 @@ function buildClusters(articles) {
+     let best = null;
+     let bestScore = 0;
+     for (const cluster of clusters) {
+-      const score = jaccard(tokens, cluster.tokens);
+-      if (score > bestScore) { bestScore = score; best = cluster; }
++      if (Math.abs(articleTime(article) - articleTime(cluster.representative)) > CLUSTER_WINDOW_MS) continue;
++      const scores = cluster.items.map(x => jaccard(tokens, x.tokens));
++      const score = scores.length ? Math.min(...scores) : 0;
++      const versionsMatch = cluster.items.every(x => modelVersionsCompatible(tokens, x.tokens));
++      if (score >= 0.48 && versionsMatch && score > bestScore) { bestScore = score; best = cluster; }
+     }
+ 
+-    if (best && bestScore >= 0.48) {
+-      best.items.push(article);
++    if (best) {
++      best.items.push({ article, tokens });
+       for (const s of article.sourceNames || [article.source]) best.sources.add(s);
+       for (const x of article.feedKeys || []) best.feedKeys.add(x);
+-      best.mentions += Math.max(1, Number(article.mentionCount) || 1);
+-      if (articleTime(article) > articleTime(best.representative)) {
+-        best.representative = article;
+-        best.tokens = tokens;
+-      }
++      best.mentions += 1;
+     } else {
+       clusters.push({
+         representative: article,
+-        items: [article],
++        items: [{ article, tokens }],
+         tokens,
+         sources: new Set(article.sourceNames || [article.source]),
+         feedKeys: new Set(article.feedKeys || []),
+-        mentions: Math.max(1, Number(article.mentionCount) || 1)
++        mentions: 1
+       });
+     }
+   }
+@@ -335,8 +478,9 @@ function buildClusters(articles) {
+     const breadth = Math.min(18, cluster.feedKeys.size * 4.5);
+     const volume = Math.min(20, Math.max(0, cluster.mentions - 1) * 6);
+     const score = Math.round((freshness + diversity + breadth + volume) * 10) / 10;
+-    const companies = [...new Set(cluster.items.flatMap(x => x.companies || []))];
+-    const categories = [...new Set(cluster.items.flatMap(x => x.categories || []))];
++    const members = cluster.items.map(x => x.article);
++    const companies = [...new Set(members.flatMap(x => x.companies || []))];
++    const categories = [...new Set(members.flatMap(x => x.categories || []))];
+     return {
+       id: cluster.representative.id,
+       title: cluster.representative.title,
+@@ -348,39 +492,61 @@ function buildClusters(articles) {
+       sourceCount: cluster.sources.size,
+       mentionCount: cluster.mentions,
+       queryCount: cluster.feedKeys.size,
+-      relatedIds: [...new Set(cluster.items.map(x => x.id))]
++      relatedIds: [...new Set(members.map(x => x.id))]
+     };
+   }).sort((a, b) => b.score - a.score || articleTime(b) - articleTime(a));
+ }
+ 
++function selectBalanced(items, limit = MAX_ARTICLES) {
++  const sorted = [...items].sort((a, b) => articleTime(b) - articleTime(a));
++  const selected = [];
++  const used = new Set();
++  const minimumPerFeed = Math.max(1, Math.floor(limit / (feeds.length * 3)));
++  for (const feed of feeds) {
++    let count = 0;
++    for (const article of sorted) {
++      if (count >= minimumPerFeed) break;
++      if (!used.has(article.id) && (article.feedKeys || []).includes(feed.key)) {
++        selected.push(article); used.add(article.id); count++;
++      }
++    }
++  }
++  for (const article of sorted) {
++    if (selected.length >= limit) break;
++    if (!used.has(article.id)) { selected.push(article); used.add(article.id); }
++  }
++  return selected.sort((a, b) => articleTime(b) - articleTime(a));
++}
++
+ function normalizeArticle(a, origin = 'cache') {
+   if (!a || typeof a !== 'object') return null;
+   const title = String(a.title || '').trim();
+   const url = safeHttpUrl(a.url);
+   if (!title || !url) return null;
+-  const source = String(a.source || 'Unknown').trim().slice(0, 200) || 'Unknown';
++  const source = truncateCodePoints(String(a.source || 'Unknown').trim(), 200) || 'Unknown';
+   const article = {
+     id: /^[a-zA-Z0-9_-]{4,80}$/.test(String(a.id || '')) ? String(a.id) : stableId(a.guid || url || title),
+-    title: title.slice(0, 600),
++    title: truncateCodePoints(title, 600),
+     url,
+     sourceUrl: safeHttpUrl(a.sourceUrl),
+     source,
+     publishedAt: normalizePublishedAt(a.publishedAt),
+-    summary: String(a.summary || '').replace(/\s+/g, ' ').trim().slice(0, 560),
+-    feedKeys: Array.isArray(a.feedKeys) ? a.feedKeys.filter(x => typeof x === 'string').slice(0, 20) : [],
+-    feedLabels: Array.isArray(a.feedLabels) ? a.feedLabels.filter(x => typeof x === 'string').slice(0, 20) : [],
+-    locale: String(a.locale || ''),
++    summary: truncateCodePoints(String(a.summary || '').replace(/\s+/g, ' ').trim(), 560),
++    feedKeys: Array.isArray(a.feedKeys) ? a.feedKeys.filter(x => typeof x === 'string').map(x => truncateCodePoints(x, 40)).slice(0, 20) : [],
++    feedLabels: Array.isArray(a.feedLabels) ? a.feedLabels.filter(x => typeof x === 'string').map(x => truncateCodePoints(x, 80)).slice(0, 20) : [],
++    locale: truncateCodePoints(String(a.locale || ''), 20),
+     origin: a.origin === 'live' || a.origin === 'fallback' ? a.origin : origin,
+-    sourceNames: Array.isArray(a.sourceNames) ? a.sourceNames.filter(x => typeof x === 'string').slice(0, 30) : [source],
+-    mentionCount: Math.max(1, Number(a.mentionCount) || 1)
++    sourceNames: Array.isArray(a.sourceNames) ? a.sourceNames.filter(x => typeof x === 'string').map(x => truncateCodePoints(x, 200)).slice(0, 30) : [source],
++    mentionCount: Math.min(1000, Math.max(1, Number(a.mentionCount) || 1))
+   };
+   Object.assign(article, classify(article));
+   return article;
+ }
+ 
+-function normalizePayload(raw, modeHint = 'cache') {
++function normalizePayload(raw, modeHint = 'cache', { requireSchema = false } = {}) {
+   if (!raw || !Array.isArray(raw.articles)) return null;
+-  const articles = raw.articles.map(a => normalizeArticle(a, modeHint)).filter(Boolean).slice(0, 180);
++  if (requireSchema && raw.schema !== CACHE_SCHEMA) return null;
++  const articles = raw.articles.slice(0, 1000).map(a => normalizeArticle(a, modeHint)).filter(Boolean).slice(0, MAX_ARTICLES);
+   if (!articles.length) return null;
+   return {
+     schema: CACHE_SCHEMA,
+@@ -389,24 +555,38 @@ function normalizePayload(raw, modeHint = 'cache') {
+     mode: ['live','stale-cache','fallback'].includes(raw.mode) ? raw.mode : modeHint,
+     degraded: Boolean(raw.degraded),
+     fetchDurationMs: Number.isFinite(Number(raw.fetchDurationMs)) ? Number(raw.fetchDurationMs) : null,
+-    sourceStats: Array.isArray(raw.sourceStats) ? raw.sourceStats.slice(0, 30) : [],
++    sourceStats: Array.isArray(raw.sourceStats) ? raw.sourceStats.slice(0, 30).map(x => ({
++      key: truncateCodePoints(x?.key, 40), label: truncateCodePoints(x?.label, 80), ok: Boolean(x?.ok),
++      count: Math.max(0, Math.min(1000, Number(x?.count) || 0)), error: truncateCodePoints(x?.error, 200)
++    })) : [],
+     articles,
+     trending: buildClusters(articles)
+   };
+ }
+ 
+-async function readJson(file) {
++async function readJson(file, { quietMissing = true } = {}) {
+   try { return JSON.parse(await fsp.readFile(file, 'utf8')); }
+-  catch { return null; }
++  catch (err) {
++    if (!(quietMissing && err?.code === 'ENOENT')) console.error(`failed to read ${path.basename(file)}:`, err.message);
++    return null;
++  }
+ }
+ 
+ async function writeJsonAtomic(file, data) {
+   await fsp.mkdir(path.dirname(file), { recursive: true });
+   const tmp = `${file}.${process.pid}.${crypto.randomBytes(4).toString('hex')}.tmp`;
++  let handle;
+   try {
+-    await fsp.writeFile(tmp, JSON.stringify(data, null, 2), 'utf8');
++    handle = await fsp.open(tmp, 'wx', 0o600);
++    await handle.writeFile(JSON.stringify(data, null, 2), 'utf8');
++    await handle.sync();
++    await handle.close();
++    handle = null;
+     await fsp.rename(tmp, file);
++    let dir;
++    try { dir = await fsp.open(path.dirname(file), 'r'); await dir.sync(); } catch {} finally { if (dir) await dir.close().catch(() => {}); }
+   } finally {
++    if (handle) await handle.close().catch(() => {});
+     fsp.unlink(tmp).catch(() => {});
+   }
+ }
+@@ -415,9 +595,11 @@ async function loadFallback() {
+   const raw = await readJson(FALLBACK_FILE);
+   const base = normalizePayload({ ...raw, mode: 'fallback', degraded: true }, 'fallback');
+   if (!base) return { schema: CACHE_SCHEMA, generatedAt: new Date().toISOString(), fetchedAt: new Date().toISOString(), mode: 'fallback', degraded: true, sourceStats: [], articles: [], trending: [] };
+-  base.contentGeneratedAt = raw?.generatedAt || null;
+-  base.generatedAt = new Date().toISOString();
++  base.contentGeneratedAt = base.generatedAt;
+   base.fetchedAt = base.generatedAt;
++  for (const article of base.articles) {
++    if (isGenericPublisherUrl(article.url)) article.url = `https://news.google.com/search?q=${encodeURIComponent(`"${article.title}"`)}`;
++  }
+   base.mode = 'fallback';
+   base.degraded = true;
+   base.sourceStats = [{ key: 'fallback', label: '内蔵フォールバック', ok: true, count: base.articles.length }];
+@@ -425,18 +607,97 @@ async function loadFallback() {
+ }
+ 
+ async function loadDiskCache() {
+-  return normalizePayload(await readJson(CACHE_FILE), 'stale-cache');
++  return normalizePayload(await readJson(CACHE_FILE), 'stale-cache', { requireSchema: true });
++}
++
++async function persistRuntimeState({ lockHeld = false } = {}) {
++  const release = lockHeld ? null : await acquireRateLock();
++  if (!lockHeld && !release) return false;
++  try {
++    const persisted = await readJson(RUNTIME_FILE);
++    if (persisted?.schema === 1) {
++      for (const row of Array.isArray(persisted.forceByIp) ? persisted.forceByIp.slice(0, 1000) : []) {
++        if (Array.isArray(row) && typeof row[0] === 'string' && Number(row[1]) > (forceByIp.get(row[0]) || 0)) forceByIp.set(row[0], Number(row[1]));
++      }
++      if (Number(persisted.refreshStateUpdatedAt) > refreshStateUpdatedAt) {
++        refreshStateUpdatedAt = Number(persisted.refreshStateUpdatedAt);
++        nextRefreshAllowedAt = Math.max(0, Number(persisted.nextRefreshAllowedAt) || 0);
++        consecutiveRefreshFailures = Math.max(0, Math.min(20, Number(persisted.consecutiveRefreshFailures) || 0));
++      }
++    }
++    const forceEntries = [...forceByIp.entries()].sort((a, b) => b[1] - a[1]).slice(0, 1000);
++    await writeJsonAtomic(RUNTIME_FILE, {
++      schema: 1, refreshStateUpdatedAt, nextRefreshAllowedAt, consecutiveRefreshFailures, lastForceRefreshAt, forceByIp: forceEntries
++    });
++    return true;
++  } catch (err) {
++    console.error('runtime state write failed:', err.message);
++    return false;
++  } finally {
++    if (release) await release();
++  }
++}
++
++async function loadRuntimeState() {
++  const state = await readJson(RUNTIME_FILE);
++  if (!state || state.schema !== 1) return;
++  nextRefreshAllowedAt = Math.max(0, Number(state.nextRefreshAllowedAt) || 0);
++  consecutiveRefreshFailures = Math.max(0, Math.min(20, Number(state.consecutiveRefreshFailures) || 0));
++  refreshStateUpdatedAt = Math.max(0, Number(state.refreshStateUpdatedAt) || 0);
++  lastForceRefreshAt = Math.max(0, Number(state.lastForceRefreshAt) || 0);
++  const now = Date.now();
++  for (const row of Array.isArray(state.forceByIp) ? state.forceByIp.slice(0, 1000) : []) {
++    if (Array.isArray(row) && typeof row[0] === 'string' && now - Number(row[1]) < FORCE_IP_INTERVAL_MS * 2) forceByIp.set(row[0], Number(row[1]));
++  }
++}
++
++async function acquireRefreshLock() {
++  await fsp.mkdir(DATA_DIR, { recursive: true });
++  try {
++    const handle = await fsp.open(REFRESH_LOCK_FILE, 'wx', 0o600);
++    await handle.writeFile(JSON.stringify({ pid: process.pid, startedAt: Date.now() }), 'utf8');
++    return async () => { await handle.close().catch(() => {}); await fsp.unlink(REFRESH_LOCK_FILE).catch(() => {}); };
++  } catch (err) {
++    if (err?.code !== 'EEXIST') throw err;
++    try {
++      const stat = await fsp.stat(REFRESH_LOCK_FILE);
++      if (Date.now() - stat.mtimeMs > Math.max(FETCH_TIMEOUT_MS * 2, 60_000)) {
++        await fsp.unlink(REFRESH_LOCK_FILE);
++        return acquireRefreshLock();
++      }
++    } catch {}
++    return null;
++  }
++}
++
++async function acquireRateLock() {
++  await fsp.mkdir(DATA_DIR, { recursive: true });
++  try {
++    const handle = await fsp.open(RATE_LOCK_FILE, 'wx', 0o600);
++    return async () => { await handle.close().catch(() => {}); await fsp.unlink(RATE_LOCK_FILE).catch(() => {}); };
++  } catch (err) {
++    if (err?.code !== 'EEXIST') throw err;
++    try {
++      const stat = await fsp.stat(RATE_LOCK_FILE);
++      if (Date.now() - stat.mtimeMs > 30_000) { await fsp.unlink(RATE_LOCK_FILE); return acquireRateLock(); }
++    } catch {}
++    return null;
++  }
+ }
+ 
+ function registerRefreshFailure() {
+   consecutiveRefreshFailures += 1;
+   const backoff = Math.min(15 * 60 * 1000, 15_000 * (2 ** Math.min(6, consecutiveRefreshFailures - 1)));
+   nextRefreshAllowedAt = Date.now() + backoff;
++  refreshStateUpdatedAt = Date.now();
++  persistRuntimeState();
+ }
+ 
+ function registerRefreshSuccess() {
+   consecutiveRefreshFailures = 0;
+   nextRefreshAllowedAt = Date.now() + REFRESH_MIN_INTERVAL_MS;
++  refreshStateUpdatedAt = Date.now();
++  persistRuntimeState();
+ }
+ 
+ async function refreshNews({ force = false } = {}) {
+@@ -444,58 +705,73 @@ async function refreshNews({ force = false } = {}) {
+   if (!force && Date.now() < nextRefreshAllowedAt) return memoryCache || await loadDiskCache() || await loadFallback();
+ 
+   refreshPromise = (async () => {
++    const releaseLock = await acquireRefreshLock();
++    if (!releaseLock) return memoryCache || await loadDiskCache() || await loadFallback();
+     const startedAt = Date.now();
+-    lastRefreshAttemptAt = startedAt;
+-    const results = await Promise.allSettled(feeds.map(async feed => {
+-      const xml = await fetchText(rssUrl(feed));
+-      const parsed = parseRss(xml, feed);
+-      if (!parsed.length) throw new Error('0 items parsed');
+-      return { feed, parsed };
+-    }));
+-
+-    const articles = [];
+-    const sourceStats = [];
+-    for (let i = 0; i < results.length; i++) {
+-      const feed = feeds[i];
+-      const r = results[i];
+-      if (r.status === 'fulfilled') {
+-        articles.push(...r.value.parsed);
+-        sourceStats.push({ key: feed.key, label: feed.label, ok: true, count: r.value.parsed.length });
+-      } else {
+-        sourceStats.push({ key: feed.key, label: feed.label, ok: false, count: 0, error: String(r.reason?.message || r.reason || 'fetch failed').slice(0, 200) });
++    try {
++      lastRefreshAttemptAt = startedAt;
++      const prior = memoryCache || await loadDiskCache();
++      const results = await Promise.allSettled(feeds.map(async feed => {
++        const xml = await fetchText(rssUrl(feed));
++        const parsed = parseRss(xml, feed);
++        if (!parsed.length) throw new Error('0 items parsed');
++        return { feed, parsed };
++      }));
++
++      const articles = [];
++      const sourceStats = [];
++      for (let i = 0; i < results.length; i++) {
++        const feed = feeds[i];
++        const r = results[i];
++        if (r.status === 'fulfilled') {
++          articles.push(...r.value.parsed);
++          sourceStats.push({ key: feed.key, label: feed.label, ok: true, count: r.value.parsed.length });
++        } else {
++          sourceStats.push({ key: feed.key, label: feed.label, ok: false, count: 0, error: truncateCodePoints(String(r.reason?.message || r.reason || 'fetch failed'), 200) });
++        }
+       }
+-    }
+ 
+-    let merged = mergeExact(articles).sort((a, b) => articleTime(b) - articleTime(a)).slice(0, 180);
+-    if (merged.length < 8) {
+-      registerRefreshFailure();
+-      const disk = await loadDiskCache();
+-      if (disk?.articles?.length) {
+-        const stale = { ...disk, mode: 'stale-cache', degraded: true, fetchedAt: new Date().toISOString(), sourceStats, trending: buildClusters(disk.articles) };
+-        memoryCache = stale;
+-        return stale;
++      const merged = selectBalanced(mergeExact(articles), MAX_ARTICLES);
++      const successfulFeeds = sourceStats.filter(x => x.ok).length;
++      const priorCount = prior?.articles?.length || 0;
++      const dangerouslySmall = !refreshQualitySafe(merged.length, successfulFeeds, priorCount);
++      if (dangerouslySmall) {
++        registerRefreshFailure();
++        if (prior?.articles?.length) {
++          const stale = { ...prior, mode: 'stale-cache', degraded: true, sourceStats, trending: buildClusters(prior.articles) };
++          memoryCache = stale;
++          return stale;
++        }
++        const fallback = await loadFallback();
++        fallback.sourceStats = [...sourceStats, ...fallback.sourceStats];
++        memoryCache = fallback;
++        return fallback;
+       }
+-      const fallback = await loadFallback();
+-      fallback.sourceStats = [...sourceStats, ...fallback.sourceStats];
+-      memoryCache = fallback;
+-      return fallback;
+-    }
+ 
+-    const payload = {
+-      schema: CACHE_SCHEMA,
+-      generatedAt: new Date().toISOString(),
+-      fetchedAt: new Date().toISOString(),
+-      mode: 'live',
+-      degraded: sourceStats.some(x => !x.ok),
+-      fetchDurationMs: Date.now() - startedAt,
+-      sourceStats,
+-      articles: merged,
+-      trending: buildClusters(merged)
+-    };
+-    memoryCache = payload;
+-    registerRefreshSuccess();
+-    try { await writeJsonAtomic(CACHE_FILE, payload); } catch (err) { console.error('cache write failed:', err.message); }
+-    return payload;
++      const payload = {
++        schema: CACHE_SCHEMA,
++        generatedAt: new Date().toISOString(),
++        fetchedAt: new Date().toISOString(),
++        mode: 'live',
++        degraded: sourceStats.some(x => !x.ok),
++        fetchDurationMs: Date.now() - startedAt,
++        sourceStats,
++        articles: merged,
++        trending: buildClusters(merged)
++      };
++      try {
++        await writeJsonAtomic(CACHE_FILE, payload);
++      } catch (err) {
++        registerRefreshFailure();
++        console.error('cache write failed:', err.message);
++        return { ...payload, mode: 'stale-cache', degraded: true, persistenceError: true };
++      }
++      memoryCache = payload;
++      registerRefreshSuccess();
++      return payload;
++    } finally {
++      await releaseLock();
++    }
+   })().finally(() => { refreshPromise = null; });
+ 
+   return refreshPromise;
+@@ -578,31 +854,56 @@ function relatedArticles(payload, article, limit = 8) {
+ }
+ 
+ function acceptsGzip(header = '') {
+-  return String(header).split(',').some(part => {
++  const encodings = new Map();
++  for (const part of String(header).split(',')) {
+     const [name, ...params] = part.trim().toLowerCase().split(';');
+-    if (name !== 'gzip' && name !== '*') return false;
+-    const q = params.map(x => x.trim()).find(x => x.startsWith('q='));
+-    return !q || Number(q.slice(2)) > 0;
+-  });
++    if (!name) continue;
++    const rawQ = params.map(x => x.trim()).find(x => /^q=/.test(x));
++    const q = rawQ ? Number(rawQ.slice(2)) : 1;
++    encodings.set(name, Number.isFinite(q) && q >= 0 && q <= 1 ? q : 0);
++  }
++  return (encodings.has('gzip') ? encodings.get('gzip') : encodings.get('*') || 0) > 0;
++}
++
++function refreshQualitySafe(articleCount, successfulFeeds, priorCount = 0) {
++  if (articleCount < 8 || successfulFeeds < Math.ceil(feeds.length / 2)) return false;
++  if (priorCount >= 20 && articleCount < Math.ceil(priorCount * 0.65)) return false;
++  return true;
++}
++
++function isSecureRequest(req) {
++  if (req.socket?.encrypted) return true;
++  return TRUST_PROXY && String(req.headers['x-forwarded-proto'] || '').split(',')[0].trim().toLowerCase() === 'https';
++}
++
++function applySecurityHeaders(req, res, requestId) {
++  res.setHeader('x-request-id', requestId);
++  res.setHeader('x-content-type-options', 'nosniff');
++  res.setHeader('referrer-policy', 'strict-origin-when-cross-origin');
++  res.setHeader('permissions-policy', 'camera=(), microphone=(), geolocation=()');
++  res.setHeader('x-frame-options', 'DENY');
++  res.setHeader('cross-origin-opener-policy', 'same-origin');
++  res.setHeader('content-security-policy', "default-src 'self'; connect-src 'self'; img-src 'self' data:; script-src 'self'; style-src 'self'; object-src 'none'; base-uri 'self'; form-action 'self'; frame-ancestors 'none'; manifest-src 'self'");
++  if (isSecureRequest(req)) res.setHeader('strict-transport-security', 'max-age=31536000; includeSubDomains');
+ }
+ 
+-async function json(res, status, body, req) {
++async function json(res, status, body, req, { cacheControl = 'no-store' } = {}) {
+   const raw = Buffer.from(JSON.stringify(body));
+-  const canGzip = acceptsGzip(req.headers['accept-encoding']) && raw.length > 1024;
++  const canGzip = req.method !== 'HEAD' && acceptsGzip(req.headers['accept-encoding']) && raw.length > 1024;
+   res.statusCode = status;
+   res.setHeader('content-type', 'application/json; charset=utf-8');
+-  res.setHeader('cache-control', 'no-store');
+-  res.setHeader('x-content-type-options', 'nosniff');
+-  res.setHeader('referrer-policy', 'strict-origin-when-cross-origin');
++  res.setHeader('cache-control', cacheControl);
+   res.setHeader('vary', 'Accept-Encoding');
+-  if (req.method === 'HEAD') return res.end();
++  if (req.method === 'HEAD') { res.setHeader('content-length', raw.length); return res.end(); }
+   if (canGzip) {
+     try {
+       const gz = await gzipAsync(raw, { level: zlib.constants.Z_BEST_SPEED });
+       res.setHeader('content-encoding', 'gzip');
++      res.setHeader('content-length', gz.length);
+       return res.end(gz);
+     } catch {}
+   }
++  res.setHeader('content-length', raw.length);
+   res.end(raw);
+ }
+ 
+@@ -621,35 +922,57 @@ async function serveStatic(req, res, pathname) {
+   try {
+     const st = await fsp.stat(file);
+     if (!st.isFile()) return false;
+-    const buf = req.method === 'HEAD' ? null : await fsp.readFile(file);
++    const raw = await fsp.readFile(file);
++    const served = path.basename(file) === 'sw.js' ? Buffer.from(raw.toString('utf8').replace('__ASSET_VERSION__', ASSET_VERSION)) : raw;
++    const buf = req.method === 'HEAD' ? null : served;
+     res.statusCode = 200;
+     res.setHeader('content-type', mime[path.extname(file).toLowerCase()] || 'application/octet-stream');
+-    res.setHeader('x-content-type-options', 'nosniff');
+-    res.setHeader('referrer-policy', 'strict-origin-when-cross-origin');
+-    res.setHeader('permissions-policy', 'camera=(), microphone=(), geolocation=()');
+-    res.setHeader('cache-control', /\.(css|js|svg|png|webmanifest)$/.test(file) ? 'public, max-age=300' : 'no-cache');
+-    res.setHeader('content-length', req.method === 'HEAD' ? st.size : buf.length);
++    res.setHeader('cache-control', path.basename(file) === 'sw.js' ? 'no-cache' : /\.(css|js|svg|png|webmanifest)$/.test(file) ? 'public, max-age=300' : 'no-cache');
++    res.setHeader('content-length', req.method === 'HEAD' ? served.length : buf.length);
+     res.end(buf || undefined);
+     return true;
+   } catch { return false; }
+ }
+ 
+ function clientIp(req) {
+-  return String(req.socket?.remoteAddress || 'unknown').replace(/^::ffff:/, '');
++  const forwarded = TRUST_PROXY ? String(req.headers['x-forwarded-for'] || '').split(',')[0].trim() : '';
++  return String(forwarded || req.socket?.remoteAddress || 'unknown').replace(/^::ffff:/, '').slice(0, 200);
+ }
+ 
+-function allowForceRefresh(req) {
++async function allowForceRefresh(req) {
++  const release = await acquireRateLock();
++  if (!release) return { allowed: false, reason: 'rate_state_busy' };
++  try {
++    const persisted = await readJson(RUNTIME_FILE);
++    if (persisted?.schema === 1) {
++      forceByIp.clear();
++      for (const row of Array.isArray(persisted.forceByIp) ? persisted.forceByIp.slice(0, 1000) : []) {
++        if (Array.isArray(row) && typeof row[0] === 'string') forceByIp.set(row[0], Number(row[1]) || 0);
++      }
++    }
+   const now = Date.now();
+-  const ip = clientIp(req);
++  for (const [key, ts] of forceByIp) if (now - ts > FORCE_IP_INTERVAL_MS * 2) forceByIp.delete(key);
++  while (forceByIp.size >= 1000) forceByIp.delete(forceByIp.keys().next().value);
++  const ip = stableId(clientIp(req));
+   const previous = forceByIp.get(ip) || 0;
+-  if (now - lastForceRefreshAt < REFRESH_MIN_INTERVAL_MS) return { allowed: false, reason: 'global_cooldown' };
+   if (now - previous < FORCE_IP_INTERVAL_MS) return { allowed: false, reason: 'client_cooldown' };
+   lastForceRefreshAt = now;
+   forceByIp.set(ip, now);
+-  if (forceByIp.size > 1000) {
+-    for (const [key, ts] of forceByIp) if (now - ts > FORCE_IP_INTERVAL_MS * 2) forceByIp.delete(key);
+-  }
++  await persistRuntimeState({ lockHeld: true });
+   return { allowed: true, reason: 'allowed' };
++  } finally {
++    await release();
++  }
++}
++
++function isSameOrigin(req) {
++  const origin = String(req.headers.origin || '');
++  if (!origin) return !req.headers['sec-fetch-site'] || req.headers['sec-fetch-site'] === 'same-origin';
++  try {
++    const expectedProtocol = isSecureRequest(req) ? 'https:' : 'http:';
++    const expected = PUBLIC_ORIGIN || `${expectedProtocol}//${req.headers.host || 'localhost'}`;
++    return new URL(origin).origin === expected;
++  } catch { return false; }
+ }
+ 
+ function metaFrom(payload, extra = {}) {
+@@ -666,15 +989,46 @@ function metaFrom(payload, extra = {}) {
+ }
+ 
+ const server = http.createServer(async (req, res) => {
++  const requestId = /^[A-Za-z0-9._-]{8,80}$/.test(String(req.headers['x-request-id'] || '')) ? String(req.headers['x-request-id']) : crypto.randomUUID();
++  const startedAt = Date.now();
++  applySecurityHeaders(req, res, requestId);
++  res.once('finish', () => console.log(JSON.stringify({ requestId, method: req.method, path: String(req.url || '').split('?')[0], status: res.statusCode, durationMs: Date.now() - startedAt })));
+   try {
+-    if (!['GET', 'HEAD'].includes(req.method)) {
+-      res.setHeader('allow', 'GET, HEAD');
++    if (!['GET', 'HEAD', 'POST'].includes(req.method)) {
++      res.setHeader('allow', 'GET, HEAD, POST');
+       return json(res, 405, { error: 'method_not_allowed' }, req);
+     }
+ 
+     const url = new URL(req.url, `http://${req.headers.host || 'localhost'}`);
+     const pathname = url.pathname;
+ 
++    if (ENFORCE_HTTPS && !isSecureRequest(req)) {
++      res.statusCode = 308;
++      res.setHeader('location', `${PUBLIC_ORIGIN}${req.url || '/'}`);
++      return res.end();
++    }
++
++    if (req.method === 'POST' && pathname !== '/api/refresh') {
++      res.setHeader('allow', 'GET, HEAD');
++      return json(res, 405, { error: 'method_not_allowed' }, req);
++    }
++
++    if (pathname === '/api/refresh') {
++      if (req.method !== 'POST') {
++        res.setHeader('allow', 'POST');
++        return json(res, 405, { error: 'method_not_allowed' }, req);
++      }
++      if (!isSameOrigin(req)) throw new HttpError(403, 'cross_origin_refresh_denied');
++      if (req.headers['transfer-encoding'] || Number(req.headers['content-length'] || 0) > 0) {
++        req.resume();
++        throw new HttpError(413, 'refresh_body_not_allowed');
++      }
++      const permit = await allowForceRefresh(req);
++      if (!permit.allowed) return json(res, 429, { error: 'refresh_throttled', reason: permit.reason }, req);
++      const payload = await getNews({ force: true });
++      return json(res, 200, { meta: metaFrom(payload, { refreshStatus: payload.mode === 'live' ? 'updated' : 'degraded', refreshReason: permit.reason }) }, req);
++    }
++
+     if (pathname === '/api/health') {
+       const p = memoryCache || await loadDiskCache();
+       const ready = Boolean(p?.articles?.length);
+@@ -692,12 +1046,14 @@ const server = http.createServer(async (req, res) => {
+     }
+ 
+     if (pathname === '/api/news') {
+-      const forceRequested = url.searchParams.get('force') === '1';
+-      const permit = forceRequested ? allowForceRefresh(req) : { allowed: false, reason: 'not_requested' };
+-      const payload = await getNews({ force: forceRequested && permit.allowed });
++      const payload = await getNews();
+       const result = queryArticles(payload, url.searchParams);
+-      const refreshStatus = !forceRequested ? 'none' : !permit.allowed ? 'throttled' : payload.mode === 'live' ? 'updated' : 'degraded';
+-      return json(res, 200, { meta: metaFrom(payload, { refreshStatus, refreshReason: permit.reason }), ...result }, req);
++      return json(res, 200, { meta: metaFrom(payload, { refreshStatus: 'none', refreshReason: 'not_requested' }), ...result }, req);
++    }
++
++    if (pathname === '/api/snapshot') {
++      const payload = await getNews();
++      return json(res, 200, payload, req, { cacheControl: 'private, max-age=0, must-revalidate' });
+     }
+ 
+     if (pathname === '/api/trending') {
+@@ -723,7 +1079,7 @@ const server = http.createServer(async (req, res) => {
+       const companyMap = new Map();
+       const catMap = new Map();
+       for (const a of payload.articles) {
+-        sourceMap.set(a.source, (sourceMap.get(a.source) || 0) + 1);
++        for (const sourceName of a.sourceNames || [a.source]) sourceMap.set(sourceName, (sourceMap.get(sourceName) || 0) + 1);
+         (a.companies || []).forEach(x => companyMap.set(x, (companyMap.get(x) || 0) + 1));
+         (a.categories || []).forEach(x => catMap.set(x, (catMap.get(x) || 0) + 1));
+       }
+@@ -741,7 +1097,9 @@ const server = http.createServer(async (req, res) => {
+     if (await serveStatic(req, res, pathname)) return;
+     res.statusCode = 404;
+     res.setHeader('content-type', 'text/plain; charset=utf-8');
+-    res.end(req.method === 'HEAD' ? undefined : '404 Not Found');
++    const notFound = Buffer.from('404 Not Found');
++    res.setHeader('content-length', notFound.length);
++    res.end(req.method === 'HEAD' ? undefined : notFound);
+   } catch (err) {
+     const status = err instanceof HttpError ? err.status : 500;
+     if (status >= 500) console.error(err);
+@@ -756,22 +1114,43 @@ async function startServer() {
+       server.removeListener('error', reject);
+       console.log(`AI BRIEF Ultra running at http://${HOST}:${PORT}`);
+       try {
++        await loadRuntimeState();
+         if (!memoryCache) memoryCache = await loadDiskCache();
+-        if (Date.now() >= nextRefreshAllowedAt) refreshNews().catch(err => console.error('startup refresh failed:', err.message));
++        const age = Date.now() - (Date.parse(memoryCache?.generatedAt || '') || 0);
++        if ((!memoryCache?.articles?.length || age >= CACHE_TTL_MS) && Date.now() >= nextRefreshAllowedAt) {
++          refreshNews().catch(err => { registerRefreshFailure(); console.error('startup refresh failed:', err.message); });
++        }
+       } catch (err) { console.error('startup initialization failed:', err.message); }
+       resolve(server);
+     });
+   });
+ }
+ 
+-if (require.main === module) startServer().catch(err => { console.error(err); process.exitCode = 1; });
++async function shutdown(signal) {
++  if (shuttingDown) return;
++  shuttingDown = true;
++  console.log(`received ${signal}, shutting down`);
++  const timer = setTimeout(() => process.exit(1), 10_000);
++  timer.unref();
++  await new Promise(resolve => server.close(() => resolve()));
++  if (refreshPromise) await Promise.race([refreshPromise.catch(() => {}), new Promise(resolve => setTimeout(resolve, 5000))]);
++  await persistRuntimeState();
++  clearTimeout(timer);
++}
++
++if (require.main === module) {
++  startServer().catch(err => { console.error(err); process.exitCode = 1; });
++  for (const signal of ['SIGINT', 'SIGTERM']) process.once(signal, () => shutdown(signal).then(() => { process.exitCode = 0; }));
++}
+ 
+ module.exports = {
+   server,
+   startServer,
++  shutdown,
+   decodeXml,
+   stripHtml,
+   safeHttpUrl,
++  isGenericPublisherUrl,
+   normalizeTitle,
+   tokenSet,
+   jaccard,
+@@ -783,5 +1162,11 @@ module.exports = {
+   normalizePayload,
+   parseBoundedInt,
+   relatedArticles,
+-  acceptsGzip
++  acceptsGzip,
++  refreshNews,
++  getNews,
++  metaFrom,
++  selectBalanced,
++  refreshQualitySafe,
++  fetchText
+ };
+diff --git a/start.bat b/start.bat
+index 7c801b9..a4b4d0e 100644
+--- a/start.bat
++++ b/start.bat
+@@ -15,6 +15,7 @@ if errorlevel 1 (
+   exit /b 1
+ )
+ echo Starting AI BRIEF Ultra...
+-start "" http://127.0.0.1:8787
++if not defined PORT set "PORT=8787"
++start "" /b powershell -NoProfile -WindowStyle Hidden -Command "$u='http://127.0.0.1:%PORT%'; for($i=0;$i -lt 100;$i++){try{if((Invoke-WebRequest -UseBasicParsing -TimeoutSec 1 ($u+'/api/health')).StatusCode -eq 200){Start-Process $u;break}}catch{};Start-Sleep -Milliseconds 200}"
+ node server.js
+ pause
+diff --git a/test.js b/test.js
+index 9122fd4..35c7e58 100644
+--- a/test.js
++++ b/test.js
+@@ -2,154 +2,114 @@
+ 
+ const assert = require('node:assert/strict');
+ const {
+-  decodeXml,
+-  safeHttpUrl,
+-  normalizeTitle,
+-  tokenSet,
+-  jaccard,
+-  classify,
+-  normalizePublishedAt,
+-  parseRss,
+-  mergeExact,
+-  buildClusters,
+-  normalizePayload,
+-  parseBoundedInt,
+-  relatedArticles,
+-  acceptsGzip
++  decodeXml, safeHttpUrl, isGenericPublisherUrl, normalizeTitle, tokenSet, jaccard, classify, normalizePublishedAt,
++  parseRss, mergeExact, buildClusters, normalizePayload, parseBoundedInt, relatedArticles,
++  acceptsGzip, selectBalanced, refreshQualitySafe
+ } = require('./server');
+ 
+ let passed = 0;
+-function test(name, fn) {
+-  try {
+-    fn();
+-    passed++;
+-    console.log(`✓ ${name}`);
+-  } catch (err) {
+-    console.error(`✗ ${name}`);
+-    throw err;
+-  }
+-}
++function test(name, fn) { try { fn(); passed++; console.log(`✓ ${name}`); } catch (err) { console.error(`✗ ${name}`); throw err; } }
++function article(id,title,time='2026-08-27T02:00:00Z',extra={}) { return { id,title,url:`https://example.com/${id}`,sourceUrl:'https://example.com/',source:'Example',publishedAt:time,summary:'',feedKeys:['global'],feedLabels:['Global'],locale:'en-US',origin:'live',companies:[],categories:['models'],sourceNames:['Example'],mentionCount:1,...extra }; }
+ 
+-test('AWS classification uses word boundaries', () => {
+-  assert.equal(classify({ title: 'New AI laws draw criticism', source: 'Reuters' }).companies.includes('amazon'), false);
+-  assert.equal(classify({ title: 'AWS launches new AI service', source: 'Reuters' }).companies.includes('amazon'), true);
++test('company classification uses boundaries, context and summaries', () => {
++  assert.equal(classify({ title:'New AI laws draw criticism', source:'Reuters' }).companies.includes('amazon'), false);
++  assert.equal(classify({ title:'Claude Monet exhibition opens', source:'Museum' }).companies.includes('anthropic'), false);
++  assert.equal(classify({ title:'Gemini horoscope for Friday', source:'Daily' }).companies.includes('google'), false);
++  assert.equal(classify({ title:'Ancient codex found', source:'History' }).companies.includes('openai'), false);
++  assert.equal(classify({ title:'Blackwell school expands', source:'Local' }).companies.includes('nvidia'), false);
++  assert.equal(classify({ title:'Amazon rainforest study', source:'Science' }).companies.includes('amazon'), false);
++  assert.equal(classify({ title:'Cloud platform update', summary:'AWS launches a new AI service', source:'Reuters' }).companies.includes('amazon'), true);
+ });
+ 
+-test('Meta classification does not match metadata', () => {
+-  assert.equal(classify({ title: 'New metadata standard for AI', source: 'Example' }).companies.includes('meta'), false);
+-  assert.equal(classify({ title: 'Meta launches Llama update', source: 'Example' }).companies.includes('meta'), true);
++test('Japanese category keywords are classified', () => {
++  const c=classify({title:'AI規制と著作権、安全性に関する研究論文',source:'Example'});
++  assert(c.categories.includes('safety')); assert(c.categories.includes('research'));
+ });
+ 
+-test('Japanese category keywords are classified', () => {
+-  const c = classify({ title: 'AI規制と著作権、安全性に関する研究論文', source: 'Example' });
+-  assert(c.categories.includes('safety'));
+-  assert(c.categories.includes('research'));
++test('Japanese titles produce useful similarity tokens', () => assert(jaccard(tokenSet('OpenAIが新モデルを正式発表'),tokenSet('OpenAI、新モデルを発表'))>0.2));
++
++test('model tokens distinguish GPT-4, GPT-4o and GPT-5', () => {
++  const a=tokenSet('OpenAI launches GPT-4 model'),b=tokenSet('OpenAI launches GPT-4o model'),c=tokenSet('OpenAI launches GPT-5 model');
++  assert(a.has('model:gpt:4')); assert(b.has('model:gpt:4:o')); assert(c.has('model:gpt:5'));
++  assert.notEqual([...a].sort().join('|'),[...b].sort().join('|'));
+ });
+ 
+-test('Japanese titles produce useful similarity tokens', () => {
+-  const a = tokenSet('OpenAIが新モデルを正式発表');
+-  const b = tokenSet('OpenAI、新モデルを発表');
+-  assert(jaccard(a, b) > 0.2);
++test('XML entities decode named spaces and supplementary code points', () => assert.equal(decodeXml('hello&nbsp;&#128512;'),'hello 😀'));
++
++test('external URLs require public HTTPS without credentials', () => {
++  for(const bad of ['javascript:alert(1)','data:text/html,test','http://example.com','https://user:pass@example.com','https://localhost/x','https://127.0.0.1/x','https://10.0.0.1/x','https://169.254.169.254/x','https://192.168.1.2/x'])assert.equal(safeHttpUrl(bad),'');
++  assert.match(safeHttpUrl('https://example.com/a'),/^https:\/\/example\.com\/a/);
+ });
+ 
+-test('Model version tokens preserve version differences', () => {
+-  const a = tokenSet('OpenAI launches GPT-4 model');
+-  const b = tokenSet('OpenAI launches GPT-5 model');
+-  assert(a.has('gpt:4'));
+-  assert(b.has('gpt:5'));
+-  assert.notEqual([...a].sort().join('|'), [...b].sort().join('|'));
++test('generic publisher landing pages are detected for fallback search links', () => {
++  assert.equal(isGenericPublisherUrl('https://openai.com/news/'),true);assert.equal(isGenericPublisherUrl('https://example.com/blog'),true);assert.equal(isGenericPublisherUrl('https://example.com/news/specific-story'),false);
+ });
+ 
+-test('Unicode numeric entities decode supplementary code points', () => {
+-  assert.equal(decodeXml('hello &#128512;'), 'hello 😀');
++test('invalid calendar and future dates are rejected', () => {
++  const now=Date.parse('2026-08-28T00:00:00Z');
++  assert.equal(normalizePublishedAt('2026-02-30T00:00:00Z',now),null);
++  assert.equal(normalizePublishedAt('2026-08-28T00:00:01Z',now),null);
++  assert.equal(normalizePublishedAt('not-a-date',now),null);
+ });
+ 
+-test('Unsafe URL schemes are rejected', () => {
+-  assert.equal(safeHttpUrl('javascript:alert(1)'), '');
+-  assert.equal(safeHttpUrl('data:text/html,test'), '');
+-  assert.match(safeHttpUrl('https://example.com/a'), /^https:\/\/example\.com\/a/);
++test('RSS parser handles attribute order, single quotes and skips invalid rows before its limit', () => {
++  const feed={key:'x',label:'X',locale:'en-US'};
++  const bad=Array.from({length:46},(_,i)=>`<item><title>Bad ${i}</title><link>http://example.com/${i}</link></item>`).join('');
++  const good=`<item><title>Good - Example</title><link>https://example.com/good</link><pubDate>Tue, 25 Aug 2026 00:00:00 GMT</pubDate><source type='publisher' url='https://example.com'>Example</source><description><![CDATA[Good&nbsp;Example]]></description></item>`;
++  const rows=parseRss(`<rss><channel>${bad}${good}</channel></rss>`,feed);
++  assert.equal(rows.length,1); assert.equal(rows[0].title,'Good'); assert.equal(rows[0].sourceUrl,'https://example.com/'); assert.equal(rows[0].summary,'');
+ });
+ 
+-test('Invalid dates remain unknown instead of becoming now', () => {
+-  assert.equal(normalizePublishedAt('not-a-date'), null);
++test('RSS summary truncation preserves complete Unicode code points', () => {
++  const feed={key:'x',label:'X',locale:'en-US'};const summary='😀'.repeat(700);
++  const [row]=parseRss(`<item><title>Unicode</title><link>https://example.com/u</link><description>${summary}</description></item>`,feed);
++  assert.equal([...row.summary].length,560); assert(row.summary.endsWith('…')); assert(!row.summary.includes('\uFFFD'));
+ });
+ 
+-test('Far-future dates are clamped to current time', () => {
+-  const now = Date.now();
+-  const value = normalizePublishedAt('2099-01-01T00:00:00Z', now);
+-  assert.equal(value, new Date(now).toISOString());
++test('exact merge keeps newest representative and does not merge distant same-title events', () => {
++  const older=article('aaaa','Same Story','2026-08-24T01:00:00Z',{source:'A',sourceNames:['A']});
++  const newer=article('bbbb','Same Story','2026-08-27T02:00:00Z',{source:'B',sourceNames:['B'],summary:'new'});
++  const near=article('cccc','Same Story','2026-08-27T01:00:00Z',{source:'C',sourceNames:['C'],feedKeys:['openai']});
++  const merged=mergeExact([older,near,newer]); assert.equal(merged.length,2);
++  const current=merged.find(x=>x.id==='bbbb'); assert(current); assert.equal(current.source,'B'); assert.equal(current.mentionCount,2); assert.deepEqual(new Set(current.sourceNames),new Set(['B','C']));
+ });
+ 
+-test('RSS parser rejects unsafe links and accepts valid articles', () => {
+-  const feed = { key: 'x', label: 'X', locale: 'en-US' };
+-  const xml = `<rss><channel>
+-    <item><title>Bad</title><link>javascript:alert(1)</link><pubDate>Tue, 25 Aug 2026 00:00:00 GMT</pubDate></item>
+-    <item><title>Good</title><link>https://example.com/good</link><pubDate>Tue, 25 Aug 2026 00:00:00 GMT</pubDate><source url="https://example.com">Example</source></item>
+-  </channel></rss>`;
+-  const rows = parseRss(xml, feed);
+-  assert.equal(rows.length, 1);
+-  assert.equal(rows[0].title, 'Good');
++test('clusters respect time windows and conflicting model versions', () => {
++  const rows=[article('a001','OpenAI launches GPT-4 model today','2026-08-27T02:00:00Z'),article('a002','OpenAI launches GPT-4 model today','2026-08-27T01:00:00Z'),article('a003','OpenAI launches GPT-5 model today','2026-08-27T01:30:00Z'),article('a004','OpenAI launches GPT-4 model today','2026-08-20T01:00:00Z')];
++  const clusters=buildClusters(rows); assert.equal(clusters.length,3); assert.equal(clusters.find(x=>x.relatedIds.includes('a001')).relatedIds.length,2);
+ });
+ 
+-test('Exact merge preserves source diversity and latest representative', () => {
+-  const base = {
+-    id: 'aaaa', title: 'Same Story', url: 'https://a.example/x', sourceUrl: 'https://a.example', source: 'A',
+-    publishedAt: '2026-08-27T01:00:00Z', summary: '', feedKeys: ['global'], feedLabels: ['Global'], locale: 'en-US', origin: 'live',
+-    companies: ['openai'], categories: ['models'], sourceNames: ['A'], mentionCount: 1
+-  };
+-  const newer = {
+-    ...base, id: 'bbbb', url: 'https://b.example/x', sourceUrl: 'https://b.example', source: 'B',
+-    publishedAt: '2026-08-27T02:00:00Z', summary: 'new', feedKeys: ['openai'], feedLabels: ['OpenAI'],
+-    companies: ['microsoft'], categories: ['business'], sourceNames: ['B']
+-  };
+-  const [m] = mergeExact([base, newer]);
+-  assert.equal(m.id, 'aaaa');
+-  assert.equal(m.source, 'B');
+-  assert.equal(m.mentionCount, 2);
+-  assert.deepEqual(new Set(m.sourceNames), new Set(['A','B']));
+-  assert(m.companies.includes('openai') && m.companies.includes('microsoft'));
+-  assert(m.categories.includes('models') && m.categories.includes('business'));
++test('trending source count uses all preserved source names without query inflation', () => {
++  const [trend]=buildClusters([article('aaaa','OpenAI launches GPT-5','2026-08-27T02:00:00Z',{sourceNames:['A','B'],feedKeys:['global','openai'],mentionCount:99})]);
++  assert.equal(trend.sourceCount,2); assert.equal(trend.mentionCount,1); assert.equal(trend.queryCount,2);
+ });
+ 
+-test('Trending uses preserved duplicate source count', () => {
+-  const article = {
+-    id: 'aaaa', title: 'OpenAI launches GPT-5', source: 'B', publishedAt: new Date().toISOString(),
+-    companies: ['openai'], categories: ['models'], feedKeys: ['global','openai'], sourceNames: ['A','B'], mentionCount: 2
+-  };
+-  const [trend] = buildClusters([article]);
+-  assert.equal(trend.sourceCount, 2);
+-  assert.equal(trend.mentionCount, 2);
++test('balanced selection preserves feed coverage before filling by freshness', () => {
++  const rows=[];for(let i=0;i<20;i++)rows.push(article(`g${i}`,'Global '+i,`2026-08-27T${String(20-i).padStart(2,'0')}:00:00Z`,{feedKeys:['global']}));rows.push(article('safe','Safety', '2026-08-20T00:00:00Z',{feedKeys:['safety']}));
++  assert(selectBalanced(rows,10).some(x=>x.id==='safe'));
+ });
+ 
+-test('API integer parser rejects NaN and out-of-range values', () => {
+-  assert.throws(() => parseBoundedInt('abc', 10, 1, 180, 'limit'), e => e.status === 400);
+-  assert.throws(() => parseBoundedInt('181', 10, 1, 180, 'limit'), e => e.status === 400);
+-  assert.equal(parseBoundedInt('25', 10, 1, 180, 'limit'), 25);
++test('refresh quality gate protects a healthy cache from partial updates', () => {
++  assert.equal(refreshQualitySafe(8,4,180),false); assert.equal(refreshQualitySafe(130,7,180),true); assert.equal(refreshQualitySafe(40,3,0),false);
+ });
+ 
+-test('gzip negotiation respects q=0', () => {
+-  assert.equal(acceptsGzip('gzip;q=0, br'), false);
+-  assert.equal(acceptsGzip('br, gzip;q=0.5'), true);
++test('cache schema is enforced and strings are bounded safely', () => {
++  const raw={schema:2,articles:[article('good1','Good')]}; assert.equal(normalizePayload(raw,'cache',{requireSchema:true}),null);
++  raw.schema=3;raw.articles[0].title='😀'.repeat(700);const payload=normalizePayload(raw,'cache',{requireSchema:true});assert.equal([...payload.articles[0].title].length,600);assert(!payload.articles[0].title.includes('\uFFFD'));
+ });
+ 
+-test('Generic-only category does not create fake related articles', () => {
+-  const target = { id:'a', title:'Completely different topic', companies:[], categories:['general'], publishedAt:'2026-08-27T00:00:00Z' };
+-  const unrelated = { id:'b', title:'Another unrelated event', companies:[], categories:['general'], publishedAt:'2026-08-27T00:00:00Z' };
+-  assert.equal(relatedArticles({ articles:[target,unrelated] }, target).length, 0);
++test('API integer parser rejects invalid ranges', () => {
++  assert.throws(()=>parseBoundedInt('abc',10,1,180,'limit'),e=>e.status===400);assert.throws(()=>parseBoundedInt('181',10,1,180,'limit'),e=>e.status===400);assert.equal(parseBoundedInt('25',10,1,180,'limit'),25);
+ });
+ 
+-test('Cache normalization rejects malformed articles and rebuilds classifications', () => {
+-  const payload = normalizePayload({ articles:[
+-    { id:'good1', title:'AWS AI launch', url:'https://example.com/x', source:'Example', publishedAt:'2026-08-27T00:00:00Z' },
+-    { id:'bad01', title:'Bad', url:'javascript:alert(1)', source:'Bad' }
+-  ]});
+-  assert.equal(payload.articles.length, 1);
+-  assert(payload.articles[0].companies.includes('amazon'));
+-  assert(Array.isArray(payload.trending));
++test('gzip negotiation gives explicit gzip precedence over wildcard', () => {
++  assert.equal(acceptsGzip('gzip;q=0, *;q=1'),false);assert.equal(acceptsGzip('*;q=0.5'),true);assert.equal(acceptsGzip('gzip;q=2'),false);assert.equal(acceptsGzip('br, gzip;q=0.5'),true);
+ });
+ 
+-test('Title normalization remains deterministic', () => {
+-  assert.equal(normalizeTitle('  GPT—5: “Test”  '), 'gpt 5 test');
++test('generic-only category does not create fake related articles', () => {
++  const target=article('aaaa','Completely different topic',undefined,{categories:['general']}),unrelated=article('bbbb','Another unrelated event',undefined,{categories:['general']});assert.equal(relatedArticles({articles:[target,unrelated]},target).length,0);
+ });
+ 
++test('title normalization remains deterministic', () => assert.equal(normalizeTitle('  GPT—5: “Test”  '),'gpt 5 test'));
++
+ console.log(`\n${passed} regression tests passed.`);
+-- 
+2.53.0.windows.3
+
